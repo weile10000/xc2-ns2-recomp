@@ -27,6 +27,7 @@
 #include <cstring>
 #include <vector>
 
+#include "nxrt/config.h"
 #include "nxrt/extras.h"
 #include "nxrt/game.h"
 #include "nxrt/movie_vdec.h"
@@ -287,7 +288,9 @@ void nvnQueueFinish(NVNqueue* queue) {
 // own last present, not for everything submitted, and a queue's fence covers that queue's submissions. Waiting for all of it made Mario Kart
 // World's main thread wait out each frame's GPU work before starting the next. NVN1 keeps the older answer.
 bool nvn2_sync_scope() {
-    static const bool on = game::info().platform == game::Platform::Switch2;
+    // [nvn] sync_scope (default on for Switch 2): off arms queue fences and window-acquire syncs with the newest serial of every queue
+    // (the Switch 1 behaviour) instead of the queue's own last submission / the slot's last present. Correct but slower for XC2 NS2.
+    static const bool on = game::info().platform == game::Platform::Switch2 && nxrt::config_get_bool("nvn", "sync_scope", true);
     return on;
 }
 

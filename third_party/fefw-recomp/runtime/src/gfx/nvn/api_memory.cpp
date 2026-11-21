@@ -19,6 +19,7 @@
 #include "nvn_core.h"
 #include "nvn_gpu.h"
 #include "nvn_impl.h"
+#include "nxrt/config.h"
 #include "nxrt/gauge.h"
 #include "nxrt/log.h"
 #include "nxrt/nvn_backend.h"
@@ -168,6 +169,10 @@ NVNboolean nvnMemoryPoolInitialize(NVNmemoryPool* pool, const NVNmemoryPoolBuild
     }
     pool_register(p);
     bind_guest(pool, p);
+    // [nvn] pool_prefetch_init (default on): every pool the GPU can reach is imported in the background as soon as it exists, not only once a
+    // buffer is made in it: texture pools (XC2 NS2's 2.5 GiB one) never get a buffer and were imported on the render thread at their first draw.
+    static const bool pf_init = nxrt::config_get_bool("nvn", "pool_prefetch_init", true);
+    if (pf_init && !is_virtual && !(info.flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS) && gpu::active()) gpu::prefetch_pool(p);
     g_memory_pools.add(1);
     g_memory_pool_bytes.add(static_cast<int64_t>(p->size));
     return 1;

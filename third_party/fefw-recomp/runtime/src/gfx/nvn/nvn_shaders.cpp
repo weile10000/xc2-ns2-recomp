@@ -396,6 +396,8 @@ bool reflect_spirv(const uint32_t* words, size_t count, ShaderReflection& out, s
     std::unordered_set<uint32_t> referenced;  // ids some instruction takes as an operand (approximation, see below)
     std::unordered_map<uint32_t, uint32_t> ptr_root;   // pointer id -> the id it is built from (access chain base, copy source)
     std::unordered_set<uint32_t> written_ptrs;         // pointers some store or atomic writes through
+    std::unordered_map<uint32_t, uint32_t> loaded_from;   // OpLoad result -> the pointer it was loaded from (storage images)
+    std::vector<uint32_t> written_images;                 // image values OpImageWrite writes to
     uint32_t entry_id = 0;
     bool have_entry = false;
 
@@ -420,6 +422,17 @@ bool reflect_spirv(const uint32_t* words, size_t count, ShaderReflection& out, s
             break;
         case 83:   // OpCopyObject: type, result, operand
             if (n >= 3) ptr_root[w[1]] = w[2];
+            break;
+        // Storage images ([gfx] render_scale: an image only read keeps its scale): the image value an OpImageWrite takes is an
+        // OpLoad of the image variable; image atomics go through OpImageTexelPointer, whose image operand is the variable itself.
+        case 61:   // OpLoad: type, result, pointer
+            if (n >= 3) loaded_from[w[1]] = w[2];
+            break;
+        case 60:   // OpImageTexelPointer: type, result, image (pointer), coordinate, sample
+            if (n >= 3) ptr_root[w[1]] = w[2];
+            break;
+        case 99:   // OpImageWrite: image, coordinate, texel
+            if (n >= 1) written_images.push_back(w[0]);
             break;
         case 227:  // OpAtomicStore: pointer, scope, semantics, value
             if (n >= 1) written_ptrs.insert(w[0]);
@@ -524,6 +537,8 @@ bool reflect_spirv(const uint32_t* words, size_t count, ShaderReflection& out, s
         }
     };
 
+    for (uint32_t img : written_images)
+        if (auto it = loaded_from.find(img); it != loaded_from.end()) written_ptrs.insert(it->second);
     std::unordered_set<uint32_t> written_vars;
     for (uint32_t p : written_ptrs) {
         for (int hop = 0; hop < 64; ++hop) {   // follow access chains and copies down to the variable

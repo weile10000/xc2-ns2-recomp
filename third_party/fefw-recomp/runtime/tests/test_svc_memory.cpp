@@ -426,6 +426,22 @@ NXTEST(map_physical_memory_commit_write_unmap) {
     teardown();
 }
 
+// An unmap of 4 MiB or more releases the host reservations on a background thread (a whole pool's ~10k VirtualFree calls stalled the
+// game's thread for ~70 ms); a map of the same range right after must still succeed: it waits for the pending releases.
+NXTEST(map_physical_memory_large_unmap_maps_again) {
+    setup();
+    const uint64_t addr = mem::kAliasBase + 0x400000;
+    const uint64_t size = 8 * kMiB;
+    CHECK_EQ(svc(0x2C, addr, size).rc, 0u);
+    *word_at(addr + size - kPg) = 0x1234u;
+    CHECK_EQ(svc(0x2D, addr, size).rc, 0u);
+    CHECK_EQ(query(addr).type, kTypeFree);          // free for the guest at once, whatever the host still holds
+    CHECK_EQ(svc(0x2C, addr, size).rc, 0u);         // mapped again: the deferred releases are done first
+    CHECK_EQ(*word_at(addr + size - kPg), 0u);      // fresh pages read as zero
+    CHECK_EQ(svc(0x2D, addr, size).rc, 0u);
+    teardown();
+}
+
 NXTEST(map_physical_memory_errors) {
     setup();
     const uint64_t addr = mem::kAliasBase + 0x40000;

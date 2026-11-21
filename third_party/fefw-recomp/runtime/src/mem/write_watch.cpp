@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,6 +32,7 @@
 #include <vector>
 
 #include "nxrt/config.h"
+#include "nxrt/ftrace.h"
 #include "nxrt/gauge.h"
 #include "nxrt/log.h"
 #include "nxrt/memory.h"
@@ -46,6 +48,7 @@ struct Region {
     int slot = -1;
     SRWLOCK lock = SRWLOCK_INIT;
     std::unique_ptr<std::atomic<uint16_t>[]> releasing;   // per page: releasers that saw it armed and have not finished its VirtualProtect (release_page)
+    bool vamm = false;
 };
 
 struct SharedLock {
@@ -158,6 +161,10 @@ bool release_page(Region* r, uint64_t page) {
     r->valid[w].fetch_and(~b, std::memory_order_acq_rel);
     r->written[w].fetch_or(b, std::memory_order_acq_rel);
     const uint64_t addr = r->base + page * kPage;
+    if (r->vamm) {   // write-watched pages are never read-only: nothing to undo
+        if (armed) rel.fetch_sub(1, std::memory_order_seq_cst);
+        return (old & b) != 0;
+    }
     if (old & b) {
         bool ok = true;
         DWORD was = 0;
@@ -375,13 +382,71 @@ struct Gauges {
 };
 Gauges g_gauges;
 
+constexpr uint64_t kGranuleBytes = 64ull << 10;
+// VAMM regions (r->vamm): the pages the CPU wrote since their arm, from the write-watch record of each 64 KiB reservation that holds an
+// armed page (GetWriteWatch with reset). They lose their armed and valid bits and count as written, like a write fault elsewhere. Owner.
+std::atomic<uint64_t> g_ww_polls{0}, g_ww_poll_us{0}, g_ww_poll_hits{0};
+void poll_write_watch(Region* r) {
+    NXFT_MIN("ww.poll", 1000000);
+    const auto t0 = std::chrono::steady_clock::now();
+    static thread_local std::vector<PVOID> addrs(16);
+    ExclusiveLock lk(r);
+    const uint64_t gpages = kGranuleBytes / kPage;
+    for (uint64_t w = 0; w < r->nwords; ++w) {
+        const uint64_t armed = r->prot[w].load(std::memory_order_acquire);
+        if (!armed) continue;
+        for (uint64_t q = 0; q < 64; q += gpages) {
+            if (!((armed >> q) & ((uint64_t{1} << gpages) - 1))) continue;
+            const uint64_t first = w * 64 + q;
+            const uint64_t addr = r->base + first * kPage;
+            ULONG_PTR count = addrs.size();
+            DWORD gran = 0;
+            g_ww_polls.fetch_add(1, std::memory_order_relaxed);
+            const bool ok = GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(addr), static_cast<SIZE_T>(kGranuleBytes), addrs.data(), &count, &gran) == 0;
+            auto drop = [&](uint64_t pg) {
+                if (pg >= r->npages || !test(r->prot.get(), pg)) return;
+                const uint64_t b = bit(pg);
+                r->prot[pg >> 6].fetch_and(~b, std::memory_order_acq_rel);
+                r->valid[pg >> 6].fetch_and(~b, std::memory_order_acq_rel);
+                r->written[pg >> 6].fetch_or(b, std::memory_order_acq_rel);
+                g_ww_poll_hits.fetch_add(1, std::memory_order_relaxed);
+            };
+            if (!ok) {   // the reservation is gone (unmapped) or not write-watched: every armed page of it counts as written
+                for (uint64_t i = 0; i < gpages; ++i) drop(first + i);
+                continue;
+            }
+            for (ULONG_PTR i = 0; i < count; ++i) drop((reinterpret_cast<uint64_t>(addrs[i]) - r->base) / kPage);
+        }
+    }
+    g_ww_poll_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()),
+                           std::memory_order_relaxed);
+    static std::atomic<uint64_t> last_ms{0};
+    const uint64_t now = GetTickCount64();
+    uint64_t l = last_ms.load();
+    if (now - l >= 10000 && last_ms.compare_exchange_strong(l, now))
+        NXLOG_I(kTag, "vamm write watch, last 10 s: %llu reservations polled in %.1f ms, %llu written pages found",
+                (unsigned long long)g_ww_polls.exchange(0), g_ww_poll_us.exchange(0) / 1000.0, (unsigned long long)g_ww_poll_hits.exchange(0));
+}
+
+// [memory] vamm_write_watch (default on): regions may also lie in the alias window [kAliasBase, +kAliasSize), where MapPhysicalMemory
+// commits private pages (the nn::os VAMM: XC2 NS2's big vertex/index pools). arm() takes only private pages there (MEM_PRIVATE: a
+// MapSharedMemory / MapTransferMemory view of the heap section in the same window is another view of heap pages and never armed), and
+// svc_memory.cpp forgets the pages of every Map/UnmapPhysicalMemory before it changes them.
+bool vamm_watch_on() {
+    static const bool on = config_get_bool("memory", "vamm_write_watch", true);
+    return on;
+}
+bool in_alias_window(uint64_t start, uint64_t end) { return start >= kAliasBase && end <= kAliasBase + kAliasSize && start < end; }
+
 }  // namespace
 
 Region* region_create(uint64_t addr, uint64_t size) {
-    if (!size || !heap_exists()) return nullptr;
+    if (!size) return nullptr;
     const uint64_t start = addr & ~(kPage - 1), end = (addr + size + kPage - 1) & ~(kPage - 1);
-    if (start < kHeapBase || end > kHeapBase + heap_reserved()) return nullptr;
+    const bool vamm = vamm_watch_on() && in_alias_window(start, end);
+    if (!vamm && (!heap_exists() || start < kHeapBase || end > kHeapBase + heap_reserved())) return nullptr;
     auto r = std::make_unique<Region>();
+    r->vamm = vamm;
     r->base = start;
     r->npages = (end - start) / kPage;
     r->nwords = (r->npages + 63) / 64;
@@ -425,7 +490,7 @@ void region_destroy(Region* r) {
     // Writable again first (faults on armed pages wait for the lock and then find the page writable), then out of the table.
     {
     ExclusiveLock lk(r);
-    for (uint64_t p = 0; p < r->npages;) {
+    for (uint64_t p = 0; p < r->npages && !r->vamm;) {
         if (!test(r->prot.get(), p)) { ++p; continue; }
         uint64_t q = p;
         while (q < r->npages && test(r->prot.get(), q)) ++q;
@@ -484,12 +549,22 @@ bool arm(Region* r, uint64_t first, uint64_t count) {
         for (uint64_t cur = a; cur < a + n;) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (VirtualQuery(reinterpret_cast<void*>(cur), &mbi, sizeof mbi) != sizeof mbi || mbi.State != MEM_COMMIT) return false;
+            if (r->vamm && mbi.Type != MEM_PRIVATE) return false;   // a view of the heap section in the alias window: not trackable
             const DWORD pr = mbi.Protect & 0xff;
             const bool already = pr == PAGE_READONLY && all_set(r->prot.get(), (cur - r->base) / kPage,
                                                                 (std::min<uint64_t>(a + n, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize) - cur) / kPage);
             if ((pr != PAGE_READWRITE && !already) || (mbi.Protect & PAGE_GUARD)) return false;
             cur = std::min<uint64_t>(a + n, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize);
         }
+    }
+    if (r->vamm) {   // the pages' write-watch record from now on (per 64 KiB reservation, svc_memory.cpp); the owner polls it (take_written)
+        for (uint64_t g = a & ~(kGranuleBytes - 1); g < a + n; g += kGranuleBytes) {
+            const uint64_t lo = std::max(g, a), hi = std::min(g + kGranuleBytes, a + n);
+            if (ResetWriteWatch(reinterpret_cast<void*>(lo), static_cast<SIZE_T>(hi - lo)) != 0) return false;
+        }
+        set_bits(r->prot.get(), first, count, true);
+        set_bits(r->valid.get(), first, count, true);
+        return true;
     }
     // Under the exclusive lock no fault is handled until both bits and protection are in place; a write that faults meanwhile waits and
     // then releases the page. A write that lands before the protection does not fault, and the owner's copy (made later) still sees it.
@@ -534,6 +609,7 @@ void set_guard_handler(GuardHandler fn) { g_guard_fn.store(fn, std::memory_order
 
 bool guard(Region* r, uint64_t first, uint64_t count) {
     if (!r || !count || first >= r->npages || count > r->npages - first) return false;
+    if (r->vamm) return false;   // no protection changes on write-watched pages
     ExclusiveLock lk(r);
     if (!all_set(r->prot.get(), first, count) || any_set(r->ban.get(), first, count)) return false;
     const uint64_t a = r->base + first * kPage, n = count * kPage;
@@ -580,8 +656,71 @@ bool all_valid_or_armed(const Region* r, uint64_t first, uint64_t count, const s
 
 uint64_t guard_faults() { return g_guard_faults.load(std::memory_order_relaxed); }
 
+std::atomic<bool> g_capture_owns_vamm{false};
+std::atomic<uint64_t> g_cap_forgot{0}, g_cap_pollfail{0};
+void capture_stats(uint64_t* f, uint64_t* p) { *f = g_cap_forgot.exchange(0); *p = g_cap_pollfail.exchange(0); }
+void set_capture_owns_vamm(bool on) { g_capture_owns_vamm.store(on); }
+bool region_is_vamm(const Region* r) { return r && r->vamm; }
+
+void capture_poll(Region* r, std::vector<uint64_t>& out) {
+    if (!r || !r->vamm) return;
+    static thread_local std::vector<PVOID> addrs(16);
+    ExclusiveLock lk(r);
+    // One query per 64 KiB reservation (svc_memory.cpp reserves each granule on its own, aligned): a region need not start on a granule, and
+    // a query that spans two reservations fails.
+    const uint64_t end = r->base + r->npages * kPage;
+    uint64_t g = r->base & ~(kGranuleBytes - 1);
+    while (g < end) {
+        const uint64_t lo = std::max(g, r->base), hi = std::min(g + kGranuleBytes, end);
+        const uint64_t p0 = (lo - r->base) / kPage, p1 = (hi - r->base) / kPage;   // pages [p0, p1) of the region
+        bool armed = false;
+        for (uint64_t w = p0 >> 6; w <= (p1 - 1) >> 6 && !armed; ++w) {
+            uint64_t bits = r->prot[w].load(std::memory_order_acquire);
+            if (w == p0 >> 6) bits &= ~((uint64_t{1} << (p0 & 63)) - 1);
+            if (w == (p1 - 1) >> 6 && ((p1 - 1) & 63) != 63) bits &= (uint64_t{1} << (((p1 - 1) & 63) + 1)) - 1;
+            armed = bits != 0;
+        }
+        if (!armed) {   // skip ahead to the granule of the next armed page
+            uint64_t q = p1;
+            while (q < r->npages && !r->prot[q >> 6].load(std::memory_order_relaxed)) q = (q | 63) + 1;
+            if (q >= r->npages) break;
+            g = std::max(g + kGranuleBytes, (r->base + q * kPage) & ~(kGranuleBytes - 1));
+            continue;
+        }
+        ULONG_PTR count = addrs.size();
+        DWORD gran = 0;
+        const bool ok = GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(lo), static_cast<SIZE_T>(hi - lo), addrs.data(), &count, &gran) == 0;
+        if (!ok) {   // the reservation is gone: every armed page of it counts as written, the old way
+            g_cap_pollfail.fetch_add(1, std::memory_order_relaxed);
+            for (uint64_t pg = p0; pg < p1; ++pg) {
+                if (!test(r->prot.get(), pg)) continue;
+                const uint64_t b = bit(pg);
+                r->prot[pg >> 6].fetch_and(~b, std::memory_order_acq_rel);
+                r->valid[pg >> 6].fetch_and(~b, std::memory_order_acq_rel);
+                r->written[pg >> 6].fetch_or(b, std::memory_order_acq_rel);
+            }
+        } else {
+            for (ULONG_PTR i = 0; i < count; ++i) {
+                const uint64_t pg = (reinterpret_cast<uint64_t>(addrs[i]) - r->base) / kPage;
+                if (pg < r->npages && test(r->prot.get(), pg)) out.push_back(pg);
+            }
+        }
+        g += kGranuleBytes;
+    }
+}
+
+void release_written(Region* r, uint64_t pg) {
+    if (!r || pg >= r->npages) return;
+    ExclusiveLock lk(r);
+    const uint64_t b = bit(pg);
+    r->prot[pg >> 6].fetch_and(~b, std::memory_order_acq_rel);
+    r->valid[pg >> 6].fetch_and(~b, std::memory_order_acq_rel);
+    r->written[pg >> 6].fetch_or(b, std::memory_order_acq_rel);
+}
+
 void take_written(Region* r, std::vector<uint64_t>& out) {
     if (!r) return;
+    if (r->vamm && !g_capture_owns_vamm.load(std::memory_order_relaxed)) poll_write_watch(r);
     for (uint64_t w = 0; w < r->nwords; ++w) {
         if (!r->written[w].load(std::memory_order_relaxed)) continue;
         uint64_t v = r->written[w].exchange(0, std::memory_order_acq_rel);
@@ -669,6 +808,8 @@ void forget(uint64_t addr, uint64_t size, bool ban) {
     for_regions(addr, size, [ban](Region* r, uint64_t first, uint64_t count) {
         if (ban) set_bits(r->ban.get(), first, count, true);
         if (!any_set(r->prot.get(), first, count) && !any_set(r->valid.get(), first, count)) return;
+        for (uint64_t q = first; q < first + count; ++q)
+            if (test(r->valid.get(), q)) g_cap_forgot.fetch_add(1, std::memory_order_relaxed);
         for (uint64_t q = first; q < first + count; ++q)           // guarded pages: read-only first (the owner's newer copy is dropped)
             if (test(r->guard.get(), q)) {              // protection first, then the bit (see unguard_locked)
                 DWORD was = 0;

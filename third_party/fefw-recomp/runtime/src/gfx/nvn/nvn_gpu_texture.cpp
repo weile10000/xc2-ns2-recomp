@@ -733,6 +733,12 @@ float attachment_scale(const Texture& t) {
     if (b.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_VIDEO_DECODE)) return 1.0f;
     const int w = b.width, h = b.height;
     if (w < 32 || h < 32) return 1.0f;
+    // [gfx] render_scale_min_width (default 0): textures narrower than this keep their size. XC2 NS2 draws its 3D scene into a
+    // 1280x720 set (G-buffer, depth, 640x360 effect masks) one of which is a storage image, so the whole set falls back to 1x and
+    // the effects that mix it with scaled masks read every other pixel (a dot grid over the shadows). 1920 keeps that set together
+    // at 1x and scales the 1920x1080 post chain and the 3840x2160 targets: the upscaler then writes the 4K output directly.
+    static const int min_w = static_cast<int>(nxrt::config_get_int("gfx", "render_scale_min_width", 0));
+    if (w < min_w) return 1.0f;
     if (w == h && (w & (w - 1)) == 0) return 1.0f;
     return sc;
 }

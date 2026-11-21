@@ -41,10 +41,12 @@ namespace nxrt::nvn::be::gpu {
 namespace {
 
 constexpr const char* kTag = "nvn.gpu";
-constexpr uint32_t kSlots = 36;                  // about three frames of submissions (the game submits ~11 times a frame): with fewer, recording waits on
-                                                 // the GPU for a submission of a recent frame and the CPU cannot get frames ahead
+constexpr uint32_t kSlots = 72;                  // about six frames of submissions (the game submits ~11 times a frame): with fewer, recording waits on
+                                                 // the GPU for a submission of a recent frame and the CPU cannot get frames ahead. 36 wrapped on XC2 NS2's
+                                                 // heavy frames (texture streaming): slot.acquire waited 22 ms for the GPU in the middle of a replay
 constexpr uint32_t kGpMax = 1024;      // GPU pass profiler: timestamps per submission
-constexpr VkDeviceSize kUploadBytes = 8ull << 20;   // per slot; larger uploads get their own staging buffer
+constexpr VkDeviceSize kUploadBytes = 16ull << 20;  // per slot; larger uploads get their own staging buffer (made and freed per submission: the
+                                                    // replay-time snapshots of [nvn] mirror_cpu_snapshot / snapshot_instances need 10-25 MiB a frame)
 
 // Live-count gauges of this file (leak monitor, nxrt/gauge.h).
 nxrt::GaugeCounter g_gauge_deferred("nvn.deferred_destroy");     // closures waiting for their submission to finish (defer_destroy, Frame::defer)
@@ -66,6 +68,11 @@ struct Slot {
     uint64_t sets_live = 0;               // descriptor sets allocated from this slot's pools since the last reset (vk.descriptor_sets)
     uint32_t gp_n = 0;                    // GPU pass profiler: timestamps written by the submission
     std::vector<std::pair<std::string, uint32_t>> gp_labels;   // label and argument of each interval (stamp i closes interval i)
+    // [nvn] tex_prologue (Frame::prologue): command buffers allocated from `pool` and reused after its reset; the open one, and the ended one
+    // that goes right before `cb` in the batch
+    std::vector<VkCommandBuffer> pros;
+    size_t pro_next = 0;
+    VkCommandBuffer pro_cur = VK_NULL_HANDLE, pro_final = VK_NULL_HANDLE;
 };
 
 struct Deferred {
@@ -91,6 +98,7 @@ struct Gpu {
     bool frame_batch = false;
     std::atomic<uint64_t> flushed_pub{0};          // `flushed`, readable from any thread
     std::atomic<bool> flush_wanted{false};         // a thread waits for (or polls) a serial still in the batch
+    std::atomic<uint64_t> flush_want_serial{0};    // the highest serial a thread asked to be flushed (want_flush): a flush that does not reach it keeps flush_wanted
     uint64_t recording = 0;               // render thread: serial of the submission being recorded (0 outside)
     std::atomic<uint64_t> last_submitted{0};
     // Serials are handed out when a submission is queued (the game thread gets its serial at once and goes on while the render thread
@@ -302,10 +310,25 @@ static std::string device_fault_text(VkDevice dev) {
 // serial (the earlier ones of the batch complete with it). Every kernel submission costs a pass over all memory the device holds: on Linux
 // (Proton, RADV) the multi-gigabyte host-memory pool imports are user pages the kernel looks up again on each one, about 2 ms a
 // submission on a Legion Go S, so 11 submissions a frame took 20 of its 25 ms. Render thread.
+// A flush reached `serial`: the request flag goes only when no thread asked for a later serial. It used to be cleared unconditionally, which lost
+// the request of a thread that asked, during or just before a flush, for a serial the render thread had not recorded yet: that serial then sat in
+// the batch until the next present, and the thread waiting for it was usually the one that queues that present (stalls of 50-150 ms in XC2 NS2,
+// [prof] trace: guest-83 sync.wait 136 ms while the GPU ran 11 ms). Order: clear, then read the wanted serial, then set again (want_flush
+// raises the serial before it sets the flag), so a request is never lost.
+void after_flush(uint64_t serial) {
+    g->flush_wanted.store(false);
+    if (g->flush_want_serial.load() > serial) g->flush_wanted.store(true);
+}
+
 void flush_batch() {
     if (g->batch.empty()) return;
-    std::vector<VkCommandBufferSubmitInfo> cbi(g->batch.size(), VkCommandBufferSubmitInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO});
-    for (size_t i = 0; i < g->batch.size(); i++) cbi[i].commandBuffer = g->batch[i]->cb;
+    std::vector<VkCommandBufferSubmitInfo> cbi;
+    cbi.reserve(g->batch.size() * 2);
+    for (size_t i = 0; i < g->batch.size(); i++) {
+        if (g->batch[i]->pro_final) { cbi.push_back({VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}); cbi.back().commandBuffer = g->batch[i]->pro_final; }
+        cbi.push_back({VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO});
+        cbi.back().commandBuffer = g->batch[i]->cb;
+    }
     const uint64_t serial = g->batch.back()->serial;
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     sig.semaphore = g->timeline;
@@ -346,7 +369,7 @@ void flush_batch() {
     }
     g->flushed = serial;
     g->flushed_pub.store(serial);
-    g->flush_wanted.store(false);
+    after_flush(serial);
     g->batch.clear();
     g->ctr.submits.fetch_add(1);
 }
@@ -354,7 +377,9 @@ void flush_batch() {
 // submit_batch = frame: a thread outside the render thread waits for a serial that may still sit in the batch; the render thread flushes
 // it at once instead of with the next present (which that thread may be the one to queue).
 void want_flush(uint64_t serial) {
-    if (!g->frame_batch || serial <= g->flushed_pub.load() || g->flush_wanted.exchange(true)) return;
+    if (!g->frame_batch || serial <= g->flushed_pub.load()) return;
+    for (uint64_t w = g->flush_want_serial.load(); serial > w && !g->flush_want_serial.compare_exchange_weak(w, serial);) {}
+    if (g->flush_wanted.exchange(true)) return;
     std::lock_guard<std::mutex> lk(g->qmu);
     g->qcv.notify_one();
 }
@@ -431,6 +456,8 @@ Slot& acquire_slot() {
     s.gp_labels.clear();
     retire();
     vkResetCommandPool(g->dev->device(), s.pool, 0);
+    s.pro_next = 0;
+    s.pro_cur = s.pro_final = VK_NULL_HANDLE;
     for (VkDescriptorPool p : s.dpools) vkResetDescriptorPool(g->dev->device(), p, 0);
     vk_gauge_descriptor_sets().sub(static_cast<int64_t>(s.sets_live));   // the reset freed them
     s.sets_live = 0;
@@ -444,6 +471,26 @@ Slot& acquire_slot() {
 }  // namespace
 
 // ---- Frame ---------------------------------------------------------------------------------------------------------------
+VkCommandBuffer Frame::prologue() {
+    Slot& s = *static_cast<Slot*>(slot);
+    if (s.pro_cur) return s.pro_cur;
+    if (s.pro_next >= s.pros.size()) {
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = s.pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        VkCommandBuffer c = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(g->dev->device(), &ai, &c) != VK_SUCCESS) return VK_NULL_HANDLE;
+        s.pros.push_back(c);
+    }
+    VkCommandBuffer c = s.pros[s.pro_next++];
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(c, &bi) != VK_SUCCESS) return VK_NULL_HANDLE;
+    s.pro_cur = c;
+    return c;
+}
+
 UploadAlloc Frame::upload(VkDeviceSize size, VkDeviceSize align) {
     Slot& s = *static_cast<Slot*>(slot);
     if (align == 0) align = 16;
@@ -679,6 +726,14 @@ namespace {
 
 // `serial`: the one reserved when the job was queued (queue_submit). 0: a submission made inside a render job (texture dumps of the trace):
 // it takes the next serial when nothing queued holds one, else it signals nothing and the queue is drained after it.
+// [nvn] tex_prologue: ends the slot's open prologue (null when none was opened).
+VkCommandBuffer end_prologue(Slot& s) {
+    VkCommandBuffer c = s.pro_cur;
+    if (!c) return VK_NULL_HANDLE;
+    s.pro_cur = VK_NULL_HANDLE;
+    return vkEndCommandBuffer(c) == VK_SUCCESS ? c : VK_NULL_HANDLE;
+}
+
 uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint64_t serial = 0) {
     NXFT("replay");
     nxrt::HitchTimer ht_replay(nxrt::kHpRenderReplay);
@@ -721,6 +776,8 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
                 static_cast<unsigned long long>(serial), e.what());
         replay_abort_submit();
         vkResetCommandPool(g->dev->device(), s.pool, 0);
+        s.pro_next = 0;
+        s.pro_cur = s.pro_final = VK_NULL_HANDLE;
         vkBeginCommandBuffer(s.cb, &bi);
         s.timed = false;
         s.gp_n = 0;
@@ -730,6 +787,7 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
     if (g->gpool && !aborted) gpass_stamp(f, "tail", 0);
     if (g->qpool && !aborted) vkCmdWriteTimestamp(s.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g->qpool, qi + 1);
     vkEndCommandBuffer(s.cb);
+    s.pro_final = end_prologue(s);
     if (!unsignalled) {
         s.serial = serial;
         g->submitted = serial;
@@ -741,11 +799,13 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
         return serial;
     }
     flush_batch();      // debug path: submitted on its own, after everything recorded before it, signalling nothing
-    VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
-    cbi.commandBuffer = s.cb;
+    VkCommandBufferSubmitInfo cbi[2] = {{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
+    uint32_t ncb = 0;
+    if (s.pro_final) cbi[ncb++].commandBuffer = s.pro_final;
+    cbi[ncb++].commandBuffer = s.cb;
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-    si.commandBufferInfoCount = 1;
-    si.pCommandBufferInfos = &cbi;
+    si.commandBufferInfoCount = ncb;
+    si.pCommandBufferInfos = cbi;
     VkResult r;
     {
         nxrt::HitchTimer ht(nxrt::kHpRenderSubmit);
@@ -771,11 +831,14 @@ bool split_flush(Frame& f) {
     flush_batch();                          // anything queued before this goes first (one queue: submission order is the order here)
     VkCommandBuffer old = f.cb;
     if (vkEndCommandBuffer(old) != VK_SUCCESS) return false;
-    VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
-    cbi.commandBuffer = old;
+    const VkCommandBuffer pro = end_prologue(*s);   // [nvn] tex_prologue: the uploads recorded for this part go right before it
+    VkCommandBufferSubmitInfo cbis[2] = {{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
+    uint32_t ncb = 0;
+    if (pro) cbis[ncb++].commandBuffer = pro;
+    cbis[ncb++].commandBuffer = old;
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-    si.commandBufferInfoCount = 1;
-    si.pCommandBufferInfos = &cbi;
+    si.commandBufferInfoCount = ncb;
+    si.pCommandBufferInfos = cbis;
     VkResult r;
     {
         nxrt::HitchTimer ht(nxrt::kHpRenderSubmit);
@@ -824,7 +887,10 @@ bool take_batch_for_present(std::vector<VkCommandBuffer>* cmds, gfx::Renderer::S
         return false;
     }
     cmds->clear();
-    for (Slot* s : g->batch) cmds->push_back(s->cb);
+    for (Slot* s : g->batch) {
+        if (s->pro_final) cmds->push_back(s->pro_final);
+        cmds->push_back(s->cb);
+    }
     p->cmds = cmds->data();
     p->count = static_cast<uint32_t>(cmds->size());
     p->timeline = g->timeline;
@@ -841,7 +907,7 @@ void present_batch_done(const gfx::Renderer::SubmitPrefix& p) {
     }
     g->flushed = p.value;
     g->flushed_pub.store(p.value);
-    g->flush_wanted.store(false);
+    after_flush(p.value);
     g->batch.clear();
     g->ctr.submits.fetch_add(1);
 }
@@ -905,7 +971,14 @@ bool async_submit() {
 uint64_t submit(const std::vector<Ref<CmdList>>& lists) {
     if (!g) return ++g_idle_serial;
     NXFT("submit");
-    return queue_submit([lists](Frame& f) {
+    // [nvn] mirror_capture: the CPU's writes since the last submit are copied now, before the game can write its next frame; capture and
+    // queueing under one lock, so captures stay in queue order
+    static std::mutex cap_order;
+    std::unique_lock<std::mutex> cap_lk(cap_order, std::defer_lock);
+    std::shared_ptr<void> cap;
+    if (mirror_capture_on()) { cap_lk.lock(); cap = mirror_capture_take(); }
+    return queue_submit([lists, cap](Frame& f) {
+        mirror_capture_set(cap);
         replay_begin_submit(f);
         replay_lists(f, lists);
         replay_end_submit(f);
@@ -1043,7 +1116,16 @@ void present(Window* window, int index) {
         g_frame_work[n & 3].store(g->reserved.load(), std::memory_order_relaxed);
         g_frame_count.store(n + 1, std::memory_order_release);
     }
-    static const int ahead = static_cast<int>(std::clamp<int64_t>(nxrt::config_get_int("nvn", "present_ahead", 1), 0, 3));
+    // auto (XC2 NS2's default, xc2_boot.cpp): lead by one frame only while [nvn] mirror_capture is on, which is what makes a guest that
+    // rewrites buffers for the next frame safe; without it 0, so the GPU never reads what the guest writes ahead (torn parts of the picture)
+    static const int ahead = [] {
+        if (nxrt::config_get_str("nvn", "present_ahead", "") == "auto") {
+            const int a = mirror_capture_on() ? 1 : 0;
+            NXLOG_I(kTag, "present_ahead: %d (auto: mirror_capture is %s)", a, a ? "on" : "off");
+            return a;
+        }
+        return static_cast<int>(std::clamp<int64_t>(nxrt::config_get_int("nvn", "present_ahead", 1), 0, 3));
+    }();
     if (ahead == 0 || on_render_thread()) {
         Ref<Window> keep = Ref<Window>::share(window);
         run_on_render_thread([&] { present_on_render_thread(window, index); });

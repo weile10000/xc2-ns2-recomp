@@ -39,6 +39,7 @@ struct Entry {
     bool slow = false;                       // Running: the job found no cache entry and transcodes (take does not wait for it)
     uint64_t held = 0;                       // bytes accounted for this entry
     std::unique_ptr<PreparedTexture> res;
+    bool offered = false;                    // handed to ready_textures() once (a result the texture never takes is not offered every submission)
     gfx::Buffer stage;                       // big results: the data already copied into a host-visible buffer for the upload (res->data is then empty)
 };
 
@@ -292,6 +293,7 @@ void worker_main() {
             e2.stage = stage;
             stage = gfx::Buffer{};
             e2.st = Entry::Done;
+            e2.offered = false;                  // a new result: ready_textures() may offer it again
             // the image holds a quick stand-in of this content: the next use uploads this result (cpu_dirty without a new generation)
             if (t->prep_prov.load(std::memory_order_acquire) == (gen | 0x80000000u)) t->cpu_dirty.store(true);
         } else {
@@ -644,6 +646,19 @@ void release_staging() {
 
 void reopen_staging() {
     if (g_state) S().quiesced.store(false);
+}
+
+void ready_textures(std::vector<Ref<Texture>>& out, size_t max) {
+    if (!g_state || !enabled()) return;
+    std::lock_guard<std::mutex> lk(S().mu);
+    for (auto& kv : S().map) {
+        if (out.size() >= max) break;
+        Entry& e = kv.second;
+        if (e.st == Entry::Done && e.res && e.keep && !e.offered) {
+            e.offered = true;
+            out.push_back(e.keep);
+        }
+    }
 }
 
 Stats stats() {

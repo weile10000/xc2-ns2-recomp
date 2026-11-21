@@ -46,6 +46,7 @@
 #include "extras/temporal.h"
 #include "nvn_pipeline.h"
 #include "nvn_shaders.h"
+#include "nvn_texprep.h"
 
 namespace nxrt::nvn::be::gpu {
 namespace {
@@ -347,6 +348,7 @@ bool g_want_depth_ro = false;         // some texture this draw samples is the c
 bool g_depth_general = false;         // ... and the draw writes that attachment's stencil too, so it needs GENERAL
 uint32_t g_color_general = 0;         // bit i: colour attachment i is also a storage image of this draw (image load/store to a render target)
 std::vector<Texture*> g_storage_bound;   // the storage images prepare_textures moved to GENERAL for this draw
+std::vector<Texture*> g_storage_unscale; // of those, the ones that must be unscaled ([gfx] render_scale: written, or bound to compute)
 
 // The layout the depth-stencil attachment has for a pass. A pass that only samples it can leave it read-only; one that
 // samples it AND writes its stencil cannot, because Vulkan has no "sampled and writable" depth layout - the descriptor
@@ -1613,13 +1615,21 @@ void prepare_textures(const ProgLayout& pl) {
     need.clear();
     need_storage.clear();
     g_storage_bound.clear();
+    g_storage_unscale.clear();
+    bool written_gfx = false;   // a draw (not a dispatch) writes a storage image, which stays unscaled
     for (const BindingDesc& d : pl.bindings) {
         TexResolved tmp;
         if (d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
             const TexResolved& r = resolve_image_ref(d, tmp);
             if (!r.tex || !tex_gpu(r.tex) || !tex_has_storage(r.tex)) continue;
             g_storage_bound.push_back(r.tex);
-            if (r.tex->cpu_dirty.load() || tex_layout(r.tex) != VK_IMAGE_LAYOUT_GENERAL || tex_scale(r.tex) != 1.0f) need_storage.push_back(r.tex);
+            // [gfx] render_scale: an image a fragment shader only reads (imageLoad at its own pixel, XC2 NS2's decals reading the G-buffer
+            // normals) keeps its scale: the translator scales imageLoad coordinates like texelFetch (TexelFetchScale), and support_for_draw
+            // hands it the scale. Written images (imageStore coordinates are not scaled) and compute bindings still go back to 1.
+            const bool keep = d.nvn_stage == kFragment && !d.shader->refl.bindings[d.index].written;
+            if (r.tex->cpu_dirty.load() || tex_layout(r.tex) != VK_IMAGE_LAYOUT_GENERAL || (tex_scale(r.tex) != 1.0f && !keep)) need_storage.push_back(r.tex);
+            if (!keep) g_storage_unscale.push_back(r.tex);
+            if (!keep && d.nvn_stage != kCompute) written_gfx = true;
             continue;
         }
         if (d.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
@@ -1659,7 +1669,63 @@ void prepare_textures(const ProgLayout& pl) {
     need.erase(std::remove_if(need.begin(), need.end(),
                               [&](Texture* t) { return std::any_of(g_storage_bound.begin(), g_storage_bound.end(), [&](Texture* s) { return shares_image(t, s); }); }),
                need.end());
+    // [gfx] render_scale: a draw that writes an unscaled storage image writes it at its own pixel (imageStore coordinates are not scaled),
+    // so its render targets go back to 1 as well and the two stay texel for texel. XC2 NS2's light list: the list (RG32UI, a colour
+    // target) and the registration mask (R32UI, a storage image) are rebuilt into each other (earlyz_mask) and read together; a list at
+    // 2x beside a mask at 1x put every other tile's lights in the wrong place (a dot grid over the shadows).
+    if (written_gfx && render_scale() != 1.0f) {
+        Texture* ts[9];
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < S.ncolor && i < 8; ++i) if (S.color_tex[i]) ts[n++] = S.color_tex[i].get();
+        if (S.depth_tex) ts[n++] = S.depth_tex.get();
+        bool any = false;
+        for (uint32_t i = 0; i < n; ++i) any |= tex_gpu(ts[i]) && tex_scale(ts[i]) != 1.0f;
+        if (any) {
+            end_pass(true);
+            for (uint32_t i = 0; i < n; ++i)
+                if (tex_gpu(ts[i]) && tex_scale(ts[i]) != 1.0f) tex_rescale(ts[i], *F, 1.0f, "a render target of a draw that writes an unscaled storage image");
+        }
+    }
     if (need.empty() && need_storage.empty()) return;
+    {   // [nvn] tex_prologue (default on): a texture no command has touched yet (its image is still UNDEFINED) gets its first upload in the
+        // submission's prologue, a command buffer that runs before everything recorded for it, so the pass need not end. An area load drew
+        // ~400 new textures in one frame, each ending and restarting the G-buffer pass (~90 ms of GPU time for that frame).
+        static const bool pro_on = config_get_bool("nvn", "tex_prologue", true);
+        if (need.size() >= 32) {   // diagnostic: what a big upload list holds (layouts, dirty, uploaded) - once per size class
+            static int told = 0;
+            if (told < 12) {
+                ++told;
+                std::map<int, int> lay;
+                int dirty = 0, ov = 0;
+                for (Texture* t : need) { lay[static_cast<int>(tex_layout(t))]++; dirty += t->cpu_dirty.load() ? 1 : 0; ov += t->overflow ? 1 : 0; }
+                std::string sl;
+                for (auto& kv : lay) sl += " " + std::to_string(kv.first) + ":" + std::to_string(kv.second);
+                NXLOG_I(kTag, "tex_prologue diag: %zu textures to prepare at one draw (pool set %d): layouts%s, cpu_dirty %d, overflow %d", need.size(),
+                        pl.has_set[kPoolSet] ? 1 : 0, sl.c_str(), dirty, ov);
+            }
+        }
+        if (pro_on) {
+            static uint64_t n_pro = 0;
+            auto first_use = [](Texture* t) { return tex_layout(t) == VK_IMAGE_LAYOUT_UNDEFINED && !t->overflow; };
+            if (std::any_of(need.begin(), need.end(), first_use)) {
+                if (VkCommandBuffer pc = F->prologue()) {
+                    Frame pf = *F;
+                    pf.cb = pc;
+                    for (Texture* t : need) {
+                        if (!first_use(t)) continue;
+                        out_texture_read(t);
+                        tex_ensure_current(t, pf);
+                        tex_transition(t, pf, tex_sampled_layout(t));
+                        ++n_pro;
+                    }
+                    need.erase(std::remove_if(need.begin(), need.end(), [](Texture* t) { return tex_layout(t) == tex_sampled_layout(t) && !t->cpu_dirty.load(); }),
+                               need.end());
+                    if ((n_pro & 1023) == 1) NXLOG_I(kTag, "tex_prologue: %llu first uploads recorded in a submission prologue so far", (unsigned long long)n_pro);
+                }
+            }
+            if (need.empty() && need_storage.empty()) return;
+        }
+    }
     for (Texture* t : need) out_texture_read(t);           // an upload reads game memory: compute results held there go back first
     for (Texture* t : need_storage) out_texture_read(t);
     end_pass(true);     // layout changes and uploads follow: each carries the dependency for its own image
@@ -1669,7 +1735,8 @@ void prepare_textures(const ProgLayout& pl) {
         tex_transition(t, *F, tex_sampled_layout(t));
     }
     for (Texture* t : need_storage) {
-        if (tex_scale(t) != 1.0f) tex_rescale(t, *F, 1.0f, "bound as a storage image");   // imageStore coordinates are not scaled (Ryujinx: ResScaleUnsupported)
+        if (tex_scale(t) != 1.0f && std::find(g_storage_unscale.begin(), g_storage_unscale.end(), t) != g_storage_unscale.end())
+            tex_rescale(t, *F, 1.0f, "bound as a storage image");   // imageStore coordinates are not scaled (Ryujinx: ResScaleUnsupported)
         tex_ensure_current(t, *F);
         tex_transition(t, *F, VK_IMAGE_LAYOUT_GENERAL);
         tex_mark_gpu_written(t);
@@ -2334,6 +2401,16 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
                         const GState::Bind& bind = S.ssbo[d.nvn_stage][slot];
                         BufRef br = resolve_buffer(bind.addr, bind.size);
                         bi = {br.buffer, br.offset, std::min<VkDeviceSize>(bind.size ? bind.size : br.avail, br.avail)};
+                        if (br.ok && mirror_capture_on()) {   // [nvn] mirror_capture: reads and writes go through the pool's copy
+                            static const bool ro_cap = nxrt::config_get_bool("nvn", "gfx_ssbo_readonly", true);
+                            const bool wr = !(ro_cap && d.nvn_stage != kCompute && !b.written);
+                            const BufRef cr = mirror_capture_bind(bind.addr, bi.range, wr);
+                            if (cr.ok && cr.buffer != br.buffer) {
+                                bi.buffer = cr.buffer;
+                                bi.offset = cr.offset;
+                                break;
+                            }
+                        }
                         if (!g_shadowing && br.ok && out_lazy() && out_overlaps(bind.addr, bi.range)) {   // a draw over a held compute result: the copy
                             const BufRef hb = held_or_pool(bind.addr, bi.range, kOutStorageXfb, false);
                             if (hb.buffer != br.buffer) {
@@ -2693,6 +2770,40 @@ void support_for_draw(const ProgLayout& pl, bool compute) {
     if (fs) frag_count = tex_count(fs);
     // the native size of the render target, for the fragment rule below
     Texture* rt = S.ncolor && S.color_tex[0] ? S.color_tex[0].get() : S.depth_tex.get();
+    // Ryujinx: a texture whose size is the render target's size times one factor on both axes interpolates the scaled pixels with
+    // gl_FragCoord (a negative scale tells TexelFetchScale to)
+    auto frag_sign = [rt](Texture* tex, float s) {
+        if (!rt || tex->b.width == 0 || tex->b.height == 0) return s;
+        const float rw = static_cast<float>(rt->b.width), rh = static_cast<float>(rt->b.height);
+        return rw / static_cast<float>(tex->b.width) == rh / static_cast<float>(tex->b.height) ? -s : s;
+    };
+    // A fragment shader's storage images an imageLoad reads at a scale (prepare_textures keeps the scale of an image only read): their
+    // scales follow the textures' (the harness numbers images after the textures, in binding order).
+    if (fs) {
+        int tex_n = 0;
+        std::vector<uint32_t> img_bindings;
+        for (const DescriptorBinding& b : fs->refl.bindings) {
+            if (b.count != 1) continue;
+            if (b.type == DescriptorType::CombinedImageSampler || b.type == DescriptorType::SampledImage || b.type == DescriptorType::UniformTexelBuffer) ++tex_n;
+            else if (b.type == DescriptorType::StorageImage || b.type == DescriptorType::StorageTexelBuffer) img_bindings.push_back(b.set << 16 | b.binding);
+        }
+        std::sort(img_bindings.begin(), img_bindings.end());
+        for (const BindingDesc& d : pl.bindings) {
+            if (d.type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || d.shader != fs) continue;
+            const DescriptorBinding& b = d.shader->refl.bindings[d.index];
+            if (b.count != 1) continue;
+            TexResolved tmp;
+            Texture* tex = resolve_image_ref(d, tmp).tex;
+            if (!tex) continue;
+            const float s = tex_scale(tex);
+            if (s == 1.0f) continue;
+            const auto at = std::find(img_bindings.begin(), img_bindings.end(), b.set << 16 | b.binding);
+            const int slot = 1 + tex_n + static_cast<int>(at - img_bindings.begin());
+            if (at == img_bindings.end() || slot >= 73) continue;
+            sc[slot] = frag_sign(tex, s);
+            any = true;
+        }
+    }
     for (const BindingDesc& d : pl.bindings) {
         if (d.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
         const DescriptorBinding& b = d.shader->refl.bindings[d.index];
@@ -4564,10 +4675,56 @@ void draw_log(uint32_t count, uint32_t instances, bool indexed) {
 static void trace_dump_geometry(uint32_t mode, uint32_t count, bool indexed, uint32_t index_type, uint64_t index_address,
                                 int32_t base_vertex, uint32_t base_instance);
 
+bool snapshot_instances_on() {
+    // auto (XC2 NS2's default, xc2_boot.cpp): off when [nvn] mirror_capture is on (vertex streams already read the captured copy)
+    static const bool on = nxrt::config_get_str("nvn", "snapshot_instances", "1") == "auto" ? !mirror_capture_on()
+                                                                                          : nxrt::config_get_bool("nvn", "snapshot_instances", true);
+    return on;
+}
+uint64_t g_snap_draws = 0, g_snap_bytes = 0, g_snap_big = 0;
+void snapshot_instances(uint32_t first_instance, uint32_t instances) {
+    if (!snapshot_instances_on() || !F) return;
+    bool done[16] = {}, any = false;
+    for (uint32_t i = 0; i < g_key_attr_count; ++i) {
+        const uint32_t b = g_key_binding[i];
+        if (b >= 16 || done[b]) continue;
+        done[b] = true;
+        if (g_key_dummy_binding && b == static_cast<uint32_t>(g_key_dummy_binding - 1)) continue;
+        const VertexStreamInfo& st = S.stream[b];
+        const GState::Bind& vb = S.vtx[b];
+        if (st.divisor <= 0 || !vb.addr) continue;
+        const uint8_t* host = static_cast<const uint8_t*>(host_ptr(vb.addr));
+        if (!host) continue;
+        const uint64_t div = static_cast<uint64_t>(st.divisor), stride = static_cast<uint64_t>(std::max<ptrdiff_t>(0, st.stride));
+        const uint64_t recs = (static_cast<uint64_t>(first_instance) + instances + div - 1) / div;
+        uint64_t bytes = (stride ? recs * stride : 0) + 256;            // + the attribute offsets inside the last record
+        if (vb.size) bytes = std::min<uint64_t>(bytes, vb.size);
+        if (bytes > (4ull << 20)) { ++g_snap_big; continue; }
+        UploadAlloc u = F->upload(bytes, 16);
+        if (!u) continue;
+        std::memcpy(u.ptr, host, static_cast<size_t>(bytes));
+        const VkDeviceSize off = u.offset, size = bytes, vstride = stride;
+        vkCmdBindVertexBuffers2(F->cb, b, 1, &u.buffer, &off, &size, &vstride);
+        g_snap_bytes += bytes;
+        any = true;
+    }
+    if (any) {
+        ++g_snap_draws;
+        g_dirty |= kVb;   // the next draw binds the game's own buffers again
+        static uint64_t next = 20000;
+        if (g_snap_draws >= next) {
+            next += 200000;
+            NXLOG_I(kTag, "snapshot_instances: %llu draws, %llu MiB of per-instance data copied at replay, %llu ranges over 4 MiB left in place",
+                    (unsigned long long)g_snap_draws, (unsigned long long)(g_snap_bytes >> 20), (unsigned long long)g_snap_big);
+        }
+    }
+}
+
 void do_draw_arrays(const P_DrawArrays& p) {
     count_primitives(p.mode, p.count, p.instance_count);
     VkPrimitiveTopology topo;
     if (!begin_draw(static_cast<int>(p.mode), false, 0, &topo)) { counters().draws_skipped.fetch_add(1); return; }
+    snapshot_instances(p.base_instance, std::max<uint32_t>(1, p.instance_count));
     draw_log(p.count, p.instance_count, false);
     quad_split_candidate(p.mode, p.count, std::max<uint32_t>(1, p.instance_count));   // [nvn] quad_split: does this draw qualify?
     const PrimConversion conv = prim_conversion(static_cast<int>(p.mode));
@@ -4723,6 +4880,7 @@ void do_draw_elements(const P_DrawElements& p) {
     count_primitives(p.mode, p.count, p.instance_count);
     VkPrimitiveTopology topo;
     if (!begin_draw(static_cast<int>(p.mode), true, static_cast<int>(p.type), &topo)) { counters().draws_skipped.fetch_add(1); return; }
+    snapshot_instances(p.base_instance, std::max<uint32_t>(1, p.instance_count));
     draw_log(p.count, p.instance_count, true);
     if (g_trace) {   // the indices and the first attributes of the first vertices
         const uint32_t isz0 = index_size_bytes(static_cast<int>(p.type));
@@ -5439,6 +5597,7 @@ void do_write_memory(uint64_t gpu_addr, const void* data, uint32_t size) {
     if (!b.ok) return;
     gpu_wrote(gpu_addr, size, kWriteUpdate);
     vkCmdUpdateBuffer(F->cb, b.buffer, b.offset, size, data);
+    mirror_capture_update(F->cb, gpu_addr, data, size);   // [nvn] mirror_capture: the same bytes into the copy
     memory_barrier(F->cb);
     gstamp("write memory");
 }
@@ -6143,6 +6302,31 @@ void replay_begin_submit(Frame& f) {
     ++g_dbg_frame;
     P = Pass();
     g_set_cache.clear();
+    {   // [nvn] tex_preupload (default on): textures whose background preparation has finished are uploaded here, outside every pass. An area
+        // load (XC2 NS2: 402 textures, 256 MiB in one frame) otherwise ended and restarted the render pass at the first draw of each one
+        // (prepare_textures): hundreds of pass breaks inside the G-buffer pass, ~90 ms of GPU time for one frame.
+        static const bool pre_on = config_get_bool("nvn", "tex_preupload", false);   // off: it uploaded textures in bursts during play, before they were needed (more 20-45 ms frames)
+        if (pre_on && texprep::enabled()) {
+            static std::vector<Ref<Texture>> ready;
+            ready.clear();
+            texprep::ready_textures(ready, 1024);
+            if (!ready.empty()) {
+                NXFT("tex.preupload");
+                uint32_t n = 0;
+                for (const Ref<Texture>& rt : ready) {
+                    Texture* t = rt.get();
+                    if (!t || t->destroyed.load() || !tex_gpu(t)) continue;
+                    out_texture_read(t);
+                    tex_ensure_current(t, f);
+                    tex_transition(t, f, tex_sampled_layout(t));
+                    ++n;
+                }
+                static uint64_t total = 0, calls = 0;
+                total += n;
+                if ((++calls & 255) == 1) NXLOG_I(kTag, "tex_preupload: %llu textures uploaded at submission start so far", (unsigned long long)total);
+            }
+        }
+    }
     {   // [nvn] lean_draws: the setting, the bound-slot masks from the state itself, and the pushed set 0 (a new command buffer has none)
         g_lean = lean_setting();
         g_bm_vtx = 0;
@@ -6312,6 +6496,8 @@ void replay_end_submit(Frame& f) {
         out_end_submit(F->cb, F->serial);
     }
     end_pass();
+    if (mirror_capture_on()) mirror_capture_end(F->cb);   // GPU writes in the copies back to the pools before the serial signals
+    mirror_end_submit();
     if ((f.serial & 127) == 0 && !g_fb_clone.empty()) fb_sweep(f.serial);
     if ((f.serial & 127) == 0 && !g_vol3d.empty()) {   // 3D copies of 2D textures no submission used for kFbIdleSubmits are released
         g_vol3d_use.clear();

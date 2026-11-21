@@ -29,6 +29,7 @@
 // tex_prep_early_kb, tex_prep_verify (test aid: every used result is compared with a fresh preparation), tex_prep_log. Implementation:
 // nvn_texprep.cpp; tests: gfx_nvn_texgpu.texprep_background_upload.
 #pragma once
+#include <vector>
 #include "nvn_core.h"
 #include "nvn_texdata.h"
 #include "nxrt/gfx.h"
@@ -63,6 +64,11 @@ bool hash_storage(const Texture& t, uint64_t& h);
 // The GPU layer is going away (gpu::tex_shutdown): finished results give their upload buffers back and no new ones are made until reopen_staging.
 void release_staging();
 void reopen_staging();
+
+// Render thread: up to `max` textures whose background result is finished (Done) and not taken yet. A job starts when a texture is bound in
+// a command list or registered big, so these are about to be drawn: the replay uploads them at the start of a submission, outside every
+// pass ([nvn] tex_preupload), instead of breaking a render pass for each one at its first draw. take() still checks the result is current.
+void ready_textures(std::vector<Ref<Texture>>& out, size_t max);
 
 // Counters for the log line and the tests.
 struct Stats {

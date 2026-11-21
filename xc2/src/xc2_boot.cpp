@@ -606,15 +606,17 @@ static nxrt::FrameLimiter *g_frame_limiter = nullptr;   // the play-mode limiter
 
 static void arm_frame_rate(uint64_t main_base) {
     const int64_t fps = nxrt::config_get_int("xc2", "fps", 0);
-    // [nvn] present_ahead (HANDOVER 61): the guest gets ahead of the replay and rewrites render targets the GPU is still reading,
-    // which shows as torn / scrambled parts of the picture. It happens at 30 Hz as well - play.cmd -PresentHz 30 leaves
-    // [xc2] fps = 0, so the old "only when the frame rate is raised" default never applied there, and the guest still queues its
-    // present and renders the next frame while the render thread is replaying. Default it to 0 whenever the player has not chosen:
-    // at 30 Hz a frame of replay is 11 ms of a 33 ms budget so the strict back pressure costs nothing, at 60 Hz it costs the
-    // frames HANDOVER 61 measured. [nvn] present_ahead still wins if the player set it.
-    if (!nxrt::config_has("nvn", "present_ahead")) nxrt::config_set("nvn", "present_ahead", "0");
-    NXLOG_I("xc2", "present_ahead = %lld (0 = the guest never leads the replay; [nvn] present_ahead overrides this default)",
-            static_cast<long long>(nxrt::config_get_int("nvn", "present_ahead", 1)));
+    // [nvn] present_ahead (HANDOVER 61): the guest used to be kept from leading the replay because it rewrote data the GPU was
+    // still reading (torn / scrambled parts of the picture). [nvn] mirror_capture gives every submission the buffer bytes of its own
+    // submit call and the GPU no longer reads guest memory live, so the guest may lead by one frame: replay and game overlap, which
+    // is what holds 60 fps. The capture needs whole-pool copies in video memory, so all three are "auto": the runtime turns the
+    // capture on when the copies' budget can hold them (a 16 GB card, not a 12 GB one, an APU or a Steam Deck), and then leads by one
+    // frame without A7's per-draw instance snapshots; otherwise all stays as it was (no lead, snapshots on). Settings the player made win.
+    if (!nxrt::config_has("nvn", "mirror_capture")) nxrt::config_set("nvn", "mirror_capture", "auto");
+    if (!nxrt::config_has("nvn", "snapshot_instances")) nxrt::config_set("nvn", "snapshot_instances", "auto");
+    if (!nxrt::config_has("nvn", "present_ahead")) nxrt::config_set("nvn", "present_ahead", "auto");
+    NXLOG_I("xc2", "present_ahead = %s (auto = 1 while [nvn] mirror_capture is on, else 0; [nvn] present_ahead overrides this default)",
+            nxrt::config_get_str("nvn", "present_ahead", "").c_str());
     if (fps <= 0) return;
     const uint64_t period_addr = main_base + 0xf65a44;      // the 1/60 the vsync-period virtual loads (0x3C888889)
     if (!nxrt::mem::is_mapped(period_addr, 4)) {

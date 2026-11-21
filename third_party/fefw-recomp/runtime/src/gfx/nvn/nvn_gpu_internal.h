@@ -8,6 +8,7 @@
 //   nvn_present.cpp      window texture -> swapchain
 // Everything declared here must be called on the render thread (gpu::on_render_thread()) unless it says otherwise.
 #pragma once
+#include <memory>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -86,6 +87,9 @@ struct Frame {
     // Runs fn on the render thread after the submission has completed on the GPU (and, for objects the replay used, no
     // later submission can still be using them if they were last used in this one).
     void defer(std::function<void()> fn);
+    // [nvn] tex_prologue: a command buffer that goes to the queue right before this submission's current one (opened on first use). First
+    // uploads of textures no command of the submission has touched yet are recorded here, so the replay need not end a render pass for them.
+    VkCommandBuffer prologue();
     // A descriptor set of this submission's pool (freed when the slot is reused). Null on failure.
     VkDescriptorSet alloc_set(VkDescriptorSetLayout layout);
 };
@@ -155,7 +159,16 @@ void mirror_span_written(uint64_t gpu_address, uint64_t size);
 bool mirror_fill(VkCommandBuffer cb, uint64_t gpu_address, uint64_t size, uint64_t* bytes);
 bool note_gpu_write(uint64_t gpu_address, uint64_t size, int use);
 void mirror_begin_submit(Frame& f, bool on);
+void mirror_end_submit();   // [nvn] mirror_cpu_snapshot: no submission is recorded any more (snapshots need one)
 void mirror_destroy(PoolGpu* p);
+// [nvn] mirror_capture (nvn_gpu_pool.cpp): every GPU access to a mirrored pool goes through its copy, filled from submit-time captures
+bool mirror_capture_on();
+BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write);
+void mirror_capture_update(VkCommandBuffer cb, uint64_t gpu_address, const void* data, uint32_t size);
+void mirror_capture_begin(Frame& f);
+std::shared_ptr<void> mirror_capture_take();          // game thread, in the submit call (null: no submit-time capture)
+void mirror_capture_set(std::shared_ptr<void> cap);   // render thread: the capture of the submission about to start
+void mirror_capture_end(VkCommandBuffer cb);
 
 // ---- compute results held in the pool copy (nvn_gpu_pool.cpp, "compute out") ----------------------------------------------------
 // A dispatch that binds the pool copy directly (nvn_replay.cpp, compute shadows) writes its result there: the range is "out" until the

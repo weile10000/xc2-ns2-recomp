@@ -44,6 +44,21 @@ void invalidate(Region* r, uint64_t first, uint64_t count);
 // Owner: appends the pages written by the CPU since the last call (page indices) and clears that record.
 void take_written(Region* r, std::vector<uint64_t>& out);
 
+// ---- submit-time capture (VAMM regions only; the nvn pool mirrors, nvn_gpu_pool.cpp mirror_capture) ----------------------------------
+// The OS write-watch record of a region has one consumer. With set_capture_owns_vamm(true) that is the capture on the game's submitting
+// thread: take_written no longer polls VAMM regions (it still returns pages release_written gave back).
+void set_capture_owns_vamm(bool on);
+bool region_is_vamm(const Region* r);
+// Any thread: appends the armed pages the CPU wrote since the last poll (and resets their watch, so a write from now on is seen by the next
+// poll). The pages STAY armed and valid: the caller copies their bytes now and keeps the copy current. A reservation that cannot be queried
+// (unmapped) drops its armed pages the old way (written, not valid) instead of appending them.
+void capture_poll(Region* r, std::vector<uint64_t>& out);
+// Any thread: a page capture_poll returned that the caller does not copy: not armed, not valid, written (as a write fault would leave it).
+void release_written(Region* r, uint64_t page);
+// Statistics since the last call (then reset): tracked pages dropped by forget (Map/UnmapPhysicalMemory), reservations capture_poll could
+// not query.
+void capture_stats(uint64_t* forgot_pages, uint64_t* poll_fail);
+
 // Any thread: the operating system is about to write [p, p + n) (a file read into guest memory): armed pages in the range become writable
 // and count as written. Cheap when no region exists.
 void before_os_write(const void* p, uint64_t n);

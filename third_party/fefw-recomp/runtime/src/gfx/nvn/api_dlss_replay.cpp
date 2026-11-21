@@ -594,6 +594,11 @@ void dlss_replay(gpu::Frame& f, Obj* o) {
     if (!e || !e->net || !e->color || !e->output) return;
     Texture* color = e->color.get();
     Texture* out = e->output.get();
+    // [gfx] render_scale: the output is a render target in all but name (the game's post passes read it like one), but this evaluation
+    // is often its first use, which made it unscaled: the upscaler then wrote 1080p into a 4K post chain. Make it at the attachment
+    // scale (and bring an unscaled one up), so the upscaler writes the full output size.
+    if (gpu::tex_gpu_attachment(out) && gpu::tex_scale_wanted(out) != gpu::tex_scale(out))
+        gpu::tex_rescale(out, f, gpu::tex_scale_wanted(out), "the upscaler's output");
     if (!gpu::tex_gpu(color) || !gpu::tex_gpu(out) || gpu::tex_is_depth(out)) {
         static bool told = false;
         if (!told) {

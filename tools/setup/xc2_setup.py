@@ -654,9 +654,8 @@ GAME_ENV = {
     # a storage image but is not in earlyz_fs, so the mask is not rebuilt"). auto = every shader, gated by the format
     # test inside the rebuild.
     "NXRT_NVN_EARLYZ_FS": "auto",
-    # The guest must not run a frame ahead of the replay: it rewrites render targets the GPU is still reading, which
-    # shows as torn or scrambled parts of the picture. The checkout's nxrt.ini sets 0; the built-in default is 1.
-    "NXRT_NVN_PRESENT_AHEAD": "0",
+    # NXRT_NVN_PRESENT_AHEAD is deliberately not here: an env value wins over everything, and whether the guest may run a
+    # frame ahead depends on the GPU ([nvn] present_ahead = auto, xc2_boot.cpp: only while [nvn] mirror_capture is on).
     "NXRT_NVN_EARLYZ_MASK": "1",
     # The deferred lighting pass is one full-screen triangle with cull BACK; with the wrong front face it is culled and
     # the whole frame stays at the G-buffer's albedo (flat, untextured, black-looking). tools/run/play-301.cmd uses 2;
