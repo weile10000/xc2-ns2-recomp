@@ -457,9 +457,13 @@ void apply_game3d_settings(const Game3dSettings& old_g, const Game3dSettings& g3
         const int idx = std::clamp(g3d.res_preset, 0, kRenderQualityCount - 1);
         const RenderQuality& rq = kRenderQuality[idx];
         std::string err;
-        // native_res off: its hooks and these scales would multiply (a 3840x2160 scene scaled again)
-        const bool ok = config_write("upscale", "render_quality", rq.key, &err) && config_write("xc2", "native_res", "0", &err) &&
-                        config_write("xc2", "res_class", "0", &err);
+        // Preserve an explicit [xc2] native_res > 0 for fixed render quality presets: xc2_boot scales native_res=2
+        // from [upscale] render_quality and disables NVN attachment scaling via game_handles_render_quality, so the
+        // two never multiply (issue #94). Only "console" (share <= 0, dynamic resolution) requires native_res = 0.
+        bool ok = config_write("upscale", "render_quality", rq.key, &err);
+        if (ok && rq.share <= 0.0 && config_get_int("xc2", "native_res", 0) > 0) {
+            ok = config_write("xc2", "native_res", "0", &err) && config_write("xc2", "res_class", "0", &err);
+        }
         if (!ok) NXLOG_W(kTag, "cannot persist the 3D render quality to nxrt.ini: %s", err.c_str());
         else NXLOG_I(kTag, "3D render quality -> %s saved to nxrt.ini (takes effect on restart)", rq.key);
     }

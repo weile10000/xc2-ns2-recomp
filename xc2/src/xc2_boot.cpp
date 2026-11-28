@@ -1345,8 +1345,18 @@ static Xc2RenderIntent resolve_xc2_render_intent() {
             const int32_t def_h = have_am_res ? am_h : 1440;
             const int64_t cw = nxrt::config_get_int("xc2", "native_w", 0);
             const int64_t ch = nxrt::config_get_int("xc2", "native_h", 0);
-            r.w = cw > 0 ? static_cast<int32_t>(cw) : def_w;
-            r.h = ch > 0 ? static_cast<int32_t>(ch) : def_h;
+            const std::string q_key = nxrt::config_get_str("upscale", "render_quality", "");
+            const nxrt::RenderQualityMode* rq = nxrt::render_quality_mode(q_key.c_str());
+            if (cw <= 0 && ch <= 0 && explicit_mode == 2 && rq && rq->share > 0.0) {
+                // Honor [upscale] render_quality % when native_res=2 has no explicit native_w/native_h override (issue #94).
+                r.w = std::clamp<int32_t>(static_cast<int32_t>(std::llround(static_cast<double>(def_w) * rq->share * 0.5) * 2), 640, def_w);
+                r.h = std::clamp<int32_t>(static_cast<int32_t>(std::llround(static_cast<double>(def_h) * rq->share * 0.5) * 2), 360, def_h);
+                r.from_quality = true;
+                r.quality_key = rq->key;
+            } else {
+                r.w = cw > 0 ? static_cast<int32_t>(cw) : def_w;
+                r.h = ch > 0 ? static_cast<int32_t>(ch) : def_h;
+            }
         } else {
             r.rcls = explicit_rcls;
             r.w = am_w;
