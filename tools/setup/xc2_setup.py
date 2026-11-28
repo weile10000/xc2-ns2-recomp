@@ -951,6 +951,168 @@ def drop_preload_pack(r, spirv):
     return removed
 
 
+def _files_equal(a, b):
+    """Stream-compare two files (length first, then 256 KiB chunks). Returns False on I/O errors."""
+    try:
+        sa = os.stat(a)
+        sb = os.stat(b)
+        if sa.st_size != sb.st_size:
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                ba = fa.read(262144)
+                bb = fb.read(262144)
+                if ba != bb:
+                    return False
+                if not ba:
+                    return True
+    except OSError:
+        return False
+
+
+def check_package_manifest(repo, install, cpu_var=None, seed_legacy=False):
+    """Compare an install folder against the current package's manifest inputs.
+
+    Single source of truth used by the launcher's setup.rs gate (and update.rs) to decide whether
+    an existing install is aligned with the current package or needs to run incremental Set up
+    ("Finish upgrade"). Never modifies game data or shader caches; when `seed_legacy=True` and a
+    legacy install without `install-manifest.json` is already aligned, records the manifest baseline
+    in `<install>/build/install-manifest.json` so subsequent upgrades detect drift accurately.
+    """
+    repo = Path(repo)
+    install = Path(install)
+    tools = package_tools(repo)
+    if not tools:
+        return {
+            "mode": "checkout",
+            "ok": True,
+            "upgrade_needed": False,
+            "stale_steps": [],
+            "reasons": [],
+            "reason": "",
+            "seeded": False,
+        }
+    _, zig, rtlib = tools
+    exe = install / "xc2_boot.exe"
+    if not exe.is_file():
+        return {
+            "mode": "package",
+            "ok": False,
+            "upgrade_needed": False,
+            "stale_steps": ["link"],
+            "reasons": ["xc2_boot.exe is not built yet"],
+            "reason": "xc2_boot.exe is not built yet",
+            "seeded": False,
+        }
+
+    patched = install / "build" / "exefs-patched"
+    exefs_dir = patched if (patched / "m3_state.json").is_file() and (patched / "main").is_file() else install / "exefs"
+    manifest = load_install_manifest(install)
+    stale_steps = []
+    reasons = []
+
+    # 1. Lift inputs (lifter + per-module sites + exefs)
+    want_lift = lift_inputs_hash(repo, exefs_dir)
+    prev_lift = manifest.get("lift")
+    lift_dir = install / "build" / "lift"
+    all_lifted = all((lift_dir / m / ("module_%s.cpp" % m)).is_file() for m in MODULES)
+    if isinstance(prev_lift, dict) and prev_lift != want_lift:
+        stale_steps.append("lift")
+        if prev_lift.get("tool") != want_lift.get("tool"):
+            reasons.append("lifter tool changed")
+        else:
+            prev_mods = prev_lift.get("modules") if isinstance(prev_lift.get("modules"), dict) else {}
+            changed = [m for m in MODULES if prev_mods.get(m) != want_lift["modules"].get(m)]
+            if changed:
+                reasons.append("hook tables or exefs changed (%s)" % ", ".join(changed))
+            else:
+                reasons.append("lift inputs changed")
+
+    # 2. Link inputs (xc2_rt.dll exported ABI + xc2_stub.cpp + lift + cpu) and runtime DLLs beside xc2_boot.exe
+    cpu_v = cpu_var or cpu_variant(zig)
+    want_link = link_inputs_hash(repo, install, rtlib, want_lift, cpu_v)
+    prev_link = manifest.get("link")
+    stamp = install / "build" / "link-stamp.json"
+    sig = runtime_signature(rtlib)
+    link_stale = False
+    if want_link is not None:
+        if prev_link is not None:
+            if prev_link != want_link:
+                link_stale = True
+                reasons.append("boot exe inputs or runtime ABI changed")
+        else:
+            if not (link_stamp_matches(stamp, sig) or exe_abi_compatible(exe, repo, install, rtlib)):
+                link_stale = True
+                reasons.append("xc2_boot.exe ABI does not match runtime/xc2_rt.dll")
+
+    out_of_sync_dlls = []
+    for dll in sorted(Path(rtlib).parent.glob("*.dll")):
+        dst = install / dll.name
+        if not dst.is_file() or not _files_equal(dll, dst):
+            out_of_sync_dlls.append(dll.name)
+    if out_of_sync_dlls:
+        link_stale = True
+        reasons.append("runtime DLLs out of sync (%s)" % ", ".join(out_of_sync_dlls))
+    if link_stale:
+        stale_steps.append("link")
+
+    # 3. Shader cache & prefill inputs
+    spirv = install / "shader_cache" / "spirv"
+    scanned = (spirv / "results.tsv").is_file() and any(spirv.glob("*.spv"))
+    prefilled = install / "build" / "prefilled"
+    prefill_stamp = install / "build" / "prefill-stamp.json"
+    inst_sig = install_runtime_signature(install)
+    want_shaders = shader_inputs_hash(repo, install)
+    want_prefill = prefill_inputs_hash(want_shaders)
+    prev_shaders = manifest.get("shaders")
+    prev_prefill = manifest.get("prefill")
+    shaders_stale = False
+    if not scanned or not prefilled.is_file():
+        shaders_stale = True
+        reasons.append("shader cache or prefill is incomplete")
+    elif prev_shaders is not None and prev_shaders != want_shaders:
+        shaders_stale = True
+        reasons.append("shader translator or archive changed")
+    elif prev_prefill is not None and prev_prefill != want_prefill:
+        shaders_stale = True
+        reasons.append("shader prefill inputs changed")
+    elif prev_prefill is None and prefill_stamp.is_file() and inst_sig is not None and not link_stamp_matches(prefill_stamp, inst_sig):
+        shaders_stale = True
+        reasons.append("shader prefill stamp out of date")
+    if shaders_stale:
+        stale_steps.append("shaders")
+
+    seeded = False
+    if not stale_steps and seed_legacy:
+        changed = False
+        if prev_lift is None and all_lifted:
+            manifest["lift"] = want_lift
+            changed = True
+        if prev_link is None and want_link is not None:
+            manifest["link"] = want_link
+            changed = True
+        if prev_shaders is None and scanned:
+            manifest["shaders"] = want_shaders
+            changed = True
+        if prev_prefill is None and prefilled.is_file():
+            manifest["prefill"] = want_prefill
+            changed = True
+        if changed:
+            save_install_manifest(install, manifest, dry=False)
+            seeded = True
+
+    ok = len(stale_steps) == 0
+    return {
+        "mode": "package",
+        "ok": ok,
+        "upgrade_needed": not ok,
+        "stale_steps": stale_steps,
+        "reasons": reasons,
+        "reason": "; ".join(reasons),
+        "seeded": seeded,
+    }
+
+
 def step_lift_package(r, repo, install, py, jobs):
     started = r.step("lift")
     exefs_dir = prepare_patched_exefs(r, repo, install)
@@ -2071,6 +2233,17 @@ def main():
         # a missing NXRT_NVN_EARLYZ_FS=auto turned distant geometry black and looked like a runtime regression).
         for key in sorted(GAME_ENV):
             print("%s=%s" % (key, GAME_ENV[key]))
+        return 0
+    if "--check-manifest" in sys.argv[1:]:
+        cap = argparse.ArgumentParser(description="check install-manifest alignment for a package install")
+        cap.add_argument("--check-manifest", action="store_true")
+        cap.add_argument("--repo", required=True)
+        cap.add_argument("--install", required=True)
+        cap.add_argument("--cpu", default=None)
+        cap.add_argument("--seed-legacy", action="store_true")
+        ca = cap.parse_args()
+        res = check_package_manifest(Path(ca.repo).resolve(), Path(ca.install).resolve(), cpu_var=ca.cpu, seed_legacy=ca.seed_legacy)
+        print(json.dumps(res, sort_keys=True))
         return 0
     ap = argparse.ArgumentParser(description="first run of the XC2 NS2 recompilation")
     ap.add_argument("--repo", required=True)

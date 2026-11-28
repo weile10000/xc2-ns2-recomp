@@ -417,6 +417,9 @@ struct SetupStatus {
     progress: setup::Progress,
     steps: Vec<setup::StepState>,
     complete: bool,
+    /// true when an existing build is out of sync with the updated package's manifest inputs or runtime DLLs
+    upgrade_needed: bool,
+    upgrade_reason: String,
     tools: Vec<setup::Tool>,
     log: Vec<String>,
     jobs: usize,
@@ -436,9 +439,16 @@ fn setup_status(app: AppHandle, state: State<Arc<setup::Shared>>) -> SetupStatus
         progress.state = "idle".into();
     }
     let running = (progress.state == "running").then(|| progress.step.clone());
-    let steps = paths(&cfg).map(|p| setup::steps(&p, running.as_deref())).unwrap_or_default();
+    let resolved = paths(&cfg).ok();
+    let gate = match &resolved {
+        Some(p) if running.is_none() => setup::manifest_gate(p),
+        _ => setup::ManifestGate::default(),
+    };
+    let steps = resolved.as_ref().map(|p| setup::steps(p, running.as_deref())).unwrap_or_default();
     SetupStatus {
-        complete: !steps.is_empty() && steps.iter().all(|s| s.state == "done"),
+        complete: !steps.is_empty() && steps.iter().all(|s| s.state == "done") && gate.ok,
+        upgrade_needed: gate.upgrade_needed,
+        upgrade_reason: gate.reason,
         steps,
         progress,
         tools: setup::check_tools(package_tools().is_some()),
@@ -496,6 +506,14 @@ fn play(app: AppHandle, state: State<Arc<setup::Shared>>, safe_mode: Option<bool
     let cfg = load_config(&app);
     let p = paths(&cfg)?;
     if !setup::complete(&p) {
+        let gate = setup::manifest_gate(&p);
+        if gate.upgrade_needed {
+            return Err(if gate.reason.is_empty() {
+                "Upgrade is not finished: open Setup and press Finish upgrade.".into()
+            } else {
+                format!("Upgrade is not finished ({}): open Setup and press Finish upgrade.", gate.reason)
+            });
+        }
         return Err("Setup is not finished: open Setup and press Set up.".into());
     }
     settings::ensure_play_paths(&p.game_dir, &p)?;

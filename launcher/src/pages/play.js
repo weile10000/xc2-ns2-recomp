@@ -57,12 +57,21 @@ export async function render(el, ctx) {
   function draw() {
     const running = status.state === 'running';
     const problems = [];
+    let upgradeNeeded = false;
     if (!ov.repo_ok) problems.push(t('play.problemRepo'));
     else if (!cfg.dump_dir) problems.push(t('play.problemNoDump'));
     else if (!chosen) problems.push(t('play.problemBadDump', { path: cfg.dump_dir, errors: report.errors.join(' ') }));
-    else if (!setup.complete) problems.push(t(setup.progress.state === 'running' ? 'play.problemSetupRunning' : 'play.problemSetupUnfinished'));
-    const ready = problems.length === 0;
+    else if (setup && setup.progress.state === 'running') problems.push(t('play.problemSetupRunning'));
+    else if (setup && !setup.complete && setup.upgrade_needed) upgradeNeeded = true;
+    else if (!setup || !setup.complete) problems.push(t('play.problemSetupUnfinished'));
+    const ready = problems.length === 0 && !upgradeNeeded;
     const left = setup ? setup.steps.filter((x) => x.state !== 'done').map((x) => stepTitle(x)) : [];
+    const upgradeReason = (setup && setup.upgrade_reason) || '';
+    const upgradeBanner = upgradeNeeded
+      ? `<div class="banner warn">${icon('circle-arrow-up')}<div>${esc(
+          upgradeReason ? t('play.upgradeBannerWithReason', { reason: upgradeReason }) : t('play.upgradeBanner'),
+        )}</div></div>`
+      : '';
 
     el.innerHTML = `
       <div class="page">
@@ -73,10 +82,16 @@ export async function render(el, ctx) {
         </div>
         ${problems.map((p) => `<div class="banner danger">${icon('circle-x')}<div>${esc(p)}</div></div>`).join('')}
         ${problems.length && ov.repo_ok ? `<div><button class="btn primary" id="to-setup">${icon(chosen ? 'hammer' : 'folder-open')}${esc(t(chosen ? 'play.openSetup' : 'play.chooseFiles'))}</button></div>` : ''}
+        ${upgradeBanner}
 
         <div class="row wrap">
-          <button class="btn primary big" id="play" ${ready && !running ? '' : 'disabled'}>${icon('play')}${esc(t(running ? 'play.running' : 'play.title'))}</button>
-          ${statusChip(status)}
+          ${
+            upgradeNeeded && !running
+              ? `<button class="btn primary big" id="finish-upgrade">${icon('hammer')}${esc(t('play.finishUpgrade'))}</button>
+                 <span class="chip warn">${icon('circle-arrow-up')}${esc(t('play.upgradePending'))}</span>`
+              : `<button class="btn primary big" id="play" ${ready && !running ? '' : 'disabled'}>${icon('play')}${esc(t(running ? 'play.running' : 'play.title'))}</button>
+                 ${statusChip(status)}`
+          }
         </div>
         <div class="banner love">${icon('heart')}<div>${esc(t('play.supportOfficial'))}</div></div>
         ${reportHtml(status)}
@@ -89,7 +104,7 @@ export async function render(el, ctx) {
             <dt>${esc(t('play.dlc'))}</dt>
             <dd>${report && report.dlc && report.dlc.length ? `${esc(t(report.dlc.length === 1 ? 'play.dlcFound' : 'play.dlcFoundMany', { count: report.dlc.length }))}<div class="path">${esc(report.dlc_dir)}</div>` : `<span class="faint">${esc(t('play.dlcNone'))}</span>`}</dd>
             <dt>${esc(t('play.setup'))}</dt>
-            <dd>${setup && setup.complete ? esc(t('common.complete')) : `<span class="faint">${esc(left.length ? t('common.todo', { list: left.join(', ') }) : t('common.notStarted'))}</span>`}</dd>
+            <dd>${setup && setup.complete ? esc(t('common.complete')) : `<span class="faint">${esc(upgradeNeeded ? t('common.upgradeNeeded', { list: left.join(', ') }) : left.length ? t('common.todo', { list: left.join(', ') }) : t('common.notStarted'))}</span>`}</dd>
             <dt>${esc(t('play.exe'))}</dt>
             <dd>${ov.exe_exists ? esc(t('common.built')) : `<span class="faint">${esc(t('common.notBuiltYet'))}</span>`}<div class="path">${esc(ov.exe)}</div></dd>
             <dt>${esc(t('play.runFolder'))}</dt>
@@ -138,6 +153,7 @@ export async function render(el, ctx) {
       </div>`;
     refreshIcons();
     el.querySelector('#play')?.addEventListener('click', () => api('play').catch((e) => toast(errText(e), 'error')));
+    el.querySelector('#finish-upgrade')?.addEventListener('click', () => ctx.go('setup'));
     el.querySelector('#record')?.addEventListener('click', async () => {
       try {
         await api('start_report');

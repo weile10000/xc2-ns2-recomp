@@ -360,6 +360,105 @@ class InstallManifestTests(unittest.TestCase):
         self.assertNotIn("old-res", rows)
         self.assertFalse(pack.exists(), "build_cache.py --refresh must explicitly drop stale spirv.preload.pack")
 
+    def test_check_package_manifest_aligned_drift_and_legacy_seeding(self):
+        # Populate minimal package tool sentinels so package_tools(repo) detects package mode.
+        (self.repo / "tools" / "python").mkdir(parents=True, exist_ok=True)
+        (self.repo / "tools" / "python" / "python.exe").write_bytes(b"py")
+        (self.repo / "tools" / "build" / "zig").mkdir(parents=True, exist_ok=True)
+        (self.repo / "tools" / "build" / "zig" / "zig.exe").write_bytes(b"zig")
+
+        exports_v1 = [
+            "xc2_rt_main", "xc2_rt_set_modules", "call_indirect", "host_import",
+            "guest_trap", "guest_unimpl", "guest_svc", "guest_mrs", "guest_msr",
+            "nx_site_inline", "nx_site_midhook", "nx_hook_entry", "stx_diag",
+            "nx_catch_call", "nx_fn_flat", "nx_fn_flat_n", "nx_fn_flat_host",
+        ]
+        dll_path = self.repo / "runtime" / "xc2_rt.dll"
+        lib_path = self.repo / "runtime" / "xc2_rt.lib"
+        ff_dll = self.repo / "runtime" / "avcodec-63.dll"
+        dll_v1 = make_minimal_pe64_dll(exports_v1, extra_padding=0)
+        dll_path.write_bytes(dll_v1)
+        lib_path.write_bytes(b"lib-v1")
+        ff_dll.write_bytes(b"ff-v1")
+
+        # Seed a legacy built install (no install-manifest.json yet), with synced DLLs and matching stamps.
+        self._seed_lifted()
+        (self.install / "xc2_boot.exe").write_bytes(b"MZ" + b"\0" * 128)
+        (self.install / "xc2_rt.dll").write_bytes(dll_v1)
+        (self.install / "avcodec-63.dll").write_bytes(b"ff-v1")
+        spirv = self.install / "shader_cache" / "spirv"
+        spirv.mkdir(parents=True)
+        (spirv / "results.tsv").write_text("hash\tresources\n0001\tr\n", encoding="utf-8")
+        (spirv / "0001.spv").write_bytes(b"\x03\x02\x23\x07")
+        (self.install / "build" / "prefilled").write_text("5 collected\n", encoding="utf-8")
+        sig = self.setup.runtime_signature(lib_path)
+        (self.install / "build" / "link-stamp.json").write_text(json.dumps(sig), encoding="utf-8")
+        inst_sig = self.setup.install_runtime_signature(self.install)
+        (self.install / "build" / "prefill-stamp.json").write_text(json.dumps(inst_sig), encoding="utf-8")
+
+        # 1) Legacy aligned install seeds install-manifest.json and passes.
+        res = self.setup.check_package_manifest(self.repo, self.install, cpu_var="x86_64+cx16+fma", seed_legacy=True)
+        self.assertTrue(res["ok"], res)
+        self.assertFalse(res["upgrade_needed"])
+        self.assertTrue(res["seeded"])
+        self.assertTrue((self.install / "build" / "install-manifest.json").is_file())
+
+        # 2) Same-ABI runtime DLL update: unsynced beside exe -> flagged as upgrade_needed (link).
+        dll_v2 = make_minimal_pe64_dll(exports_v1, extra_padding=512)
+        dll_path.write_bytes(dll_v2)
+        res_unsynced = self.setup.check_package_manifest(self.repo, self.install, cpu_var="x86_64+cx16+fma")
+        self.assertFalse(res_unsynced["ok"])
+        self.assertTrue(res_unsynced["upgrade_needed"])
+        self.assertEqual(res_unsynced["stale_steps"], ["link"])
+        self.assertIn("runtime DLLs out of sync", res_unsynced["reason"])
+
+        # 3) Once update::install() syncs xc2_rt.dll beside xc2_boot.exe -> aligned immediately (no Setup needed!).
+        (self.install / "xc2_rt.dll").write_bytes(dll_v2)
+        res_synced = self.setup.check_package_manifest(self.repo, self.install, cpu_var="x86_64+cx16+fma")
+        self.assertTrue(res_synced["ok"], res_synced)
+        self.assertFalse(res_synced["upgrade_needed"])
+
+        # 4) Translator DLL change -> flags shaders only.
+        (self.repo / "tools" / "spirv_harness" / "Spv.Generator.dll").write_bytes(b"spvgen-v2")
+        res_sh = self.setup.check_package_manifest(self.repo, self.install, cpu_var="x86_64+cx16+fma")
+        self.assertFalse(res_sh["ok"])
+        self.assertTrue(res_sh["upgrade_needed"])
+        self.assertEqual(res_sh["stale_steps"], ["shaders"])
+        (self.repo / "tools" / "spirv_harness" / "Spv.Generator.dll").write_bytes(b"spvgen-v1")
+
+        # 5) Sites change -> flags both lift and link.
+        (self.repo / "xc2" / "sites" / "sites-main.txt").write_text("0x100\n0x200\n", encoding="utf-8")
+        res_lift = self.setup.check_package_manifest(self.repo, self.install, cpu_var="x86_64+cx16+fma")
+        self.assertFalse(res_lift["ok"])
+        self.assertEqual(res_lift["stale_steps"], ["lift", "link"])
+        (self.repo / "xc2" / "sites" / "sites-main.txt").write_text("0x100\n", encoding="utf-8")
+
+        # 6) Runtime ABI break (18th export) even with synced DLL -> flags link.
+        dll_v3 = make_minimal_pe64_dll(exports_v1 + ["xc2_rt_extra_export"])
+        dll_path.write_bytes(dll_v3)
+        (self.install / "xc2_rt.dll").write_bytes(dll_v3)
+        res_abi = self.setup.check_package_manifest(self.repo, self.install, cpu_var="x86_64+cx16+fma")
+        self.assertFalse(res_abi["ok"])
+        self.assertEqual(res_abi["stale_steps"], ["link"])
+
+        # 7) CLI --check-manifest outputs valid JSON cleanly.
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "setup" / "xc2_setup.py"),
+                "--check-manifest",
+                "--repo", str(self.repo),
+                "--install", str(self.install),
+                "--cpu", "x86_64+cx16+fma",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + "\n" + proc.stderr)
+        parsed = json.loads(proc.stdout)
+        self.assertFalse(parsed["ok"])
+        self.assertEqual(parsed["stale_steps"], ["link"])
+
 
 if __name__ == "__main__":
     unittest.main()

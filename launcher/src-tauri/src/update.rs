@@ -237,7 +237,8 @@ impl Run<'_> {
         let top = self.unpack(&zip, &work.join("stage"))?;
         self.cancelled()?;
         self.set("install", 0, 0, "Installing");
-        install(&self.install, &top, &work.join("old"))?;
+        install_with_game_dir(&self.install, &self.game_dir, &top, &work.join("old"))?;
+        crate::setup::invalidate_manifest_cache();
         let _ = fs::remove_file(&zip);
         let _ = fs::remove_dir_all(work.join("stage"));
         self.set("check", 0, 0, "Checking whether the game has to be built again");
@@ -389,12 +390,120 @@ fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Top-level `*.dll` files in `dir`, sorted by file name.
+fn top_level_dlls(dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(dir) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dll")) {
+            continue;
+        }
+        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            out.push((name.to_string(), p));
+        }
+    }
+    out.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+    out
+}
+
+/// Syncs `install/runtime/*.dll` next to an existing `game_dir/xc2_boot.exe`, backing up previous copies inside
+/// `game_dir/.update-old-dlls` (same volume as `game_dir` so renames never fail across drives) and rolling back
+/// cleanly if any copy or rename fails. Player-added DLLs in `game_dir` are left untouched; only DLLs that previously
+/// shipped in `old/runtime/` and disappeared from `install/runtime/` are removed.
+fn sync_runtime_dlls(install: &Path, game_dir: &Path, old: &Path) -> Result<(), String> {
+    if !game_dir.join("xc2_boot.exe").is_file() {
+        return Ok(());
+    }
+    let runtime_dir = install.join("runtime");
+    if !runtime_dir.is_dir() {
+        return Ok(());
+    }
+    let new_dlls = top_level_dlls(&runtime_dir);
+    let new_names: std::collections::HashSet<String> = new_dlls.iter().map(|(n, _)| n.to_ascii_lowercase()).collect();
+    let stale_dlls: Vec<String> = top_level_dlls(&old.join("runtime"))
+        .into_iter()
+        .map(|(n, _)| n)
+        .filter(|n| !new_names.contains(&n.to_ascii_lowercase()))
+        .collect();
+
+    let backup_dir = game_dir.join(".update-old-dlls");
+    if backup_dir.exists() {
+        let _ = fs::remove_dir_all(&backup_dir);
+    }
+    // (filename, old file moved to backup_dir, new file placed at game_dir/<name>)
+    let mut done: Vec<(String, bool, bool)> = Vec::new();
+    let mut tmp_paths: Vec<PathBuf> = Vec::new();
+    let mut step = || -> Result<(), String> {
+        let ensure_backup = || -> Result<(), String> {
+            fs::create_dir_all(&backup_dir).map_err(|e| format!("cannot create {}: {e}", backup_dir.display()))
+        };
+        for name in &stale_dlls {
+            let target = game_dir.join(name);
+            if fs::symlink_metadata(&target).is_ok() {
+                ensure_backup()?;
+                rename_retry(&target, &backup_dir.join(name)).map_err(|e| {
+                    format!("cannot move {} aside (is the game or another program using it?): {e}", target.display())
+                })?;
+                done.push((name.clone(), true, false));
+            }
+        }
+        for (name, src) in &new_dlls {
+            let target = game_dir.join(name);
+            if target.is_file() && files_equal(src, &target).unwrap_or(false) {
+                continue;
+            }
+            let staged = game_dir.join(format!(".{name}.upd-new"));
+            let _ = fs::remove_file(&staged);
+            fs::copy(src, &staged).map_err(|e| format!("cannot copy {} to {}: {e}", src.display(), staged.display()))?;
+            tmp_paths.push(staged.clone());
+            let had = fs::symlink_metadata(&target).is_ok();
+            if had {
+                ensure_backup()?;
+                rename_retry(&target, &backup_dir.join(name)).map_err(|e| {
+                    format!("cannot move {} aside (is the game or another program using it?): {e}", target.display())
+                })?;
+            }
+            done.push((name.clone(), had, false));
+            rename_retry(&staged, &target).map_err(|e| format!("cannot put {} in place: {e}", target.display()))?;
+            done.last_mut().unwrap().2 = true;
+        }
+        Ok(())
+    };
+    if let Err(e) = step() {
+        for p in &tmp_paths {
+            let _ = fs::remove_file(p);
+        }
+        for (name, had, placed) in done.iter().rev() {
+            let target = game_dir.join(name);
+            if *placed {
+                let _ = fs::remove_file(&target);
+            }
+            if *had {
+                let _ = rename_retry(&backup_dir.join(name), &target);
+            }
+        }
+        let _ = fs::remove_dir_all(&backup_dir);
+        return Err(e);
+    }
+    let _ = fs::remove_dir_all(&backup_dir);
+    Ok(())
+}
+
 /// Puts the new package `top` in place over `install`, file by file (a folder cannot be renamed while anything holds a handle
 /// under it, a file can). Each old file goes to `old` first: the files the new package replaces, and in the package's own folders
-/// (those the new package has, such as tools/) the files it no longer has. Anything else in the install folder (fefw.exe,
-/// fefw.ini, save/, shader_cache/, build/) is left alone. Any failure moves back what was already moved. The running launcher
-/// can be moved too (Windows allows renaming a running exe; on Linux the running AppImage keeps its old file until it exits).
+/// (those the new package has, such as tools/) the files it no longer has. Anything else in the install folder (xc2_boot.exe,
+/// nxrt.ini, save/, shader_cache/, build/) is left alone. When `xc2_boot.exe` already exists in `game_dir`, `runtime/*.dll` are
+/// also synced beside it. Any failure moves back what was already moved. The running launcher can be moved too (Windows allows
+/// renaming a running exe; on Linux the running AppImage keeps its old file until it exits).
 pub fn install(install: &Path, top: &Path, old: &Path) -> Result<(), String> {
+    install_with_game_dir(install, install, top, old)
+}
+
+pub fn install_with_game_dir(install: &Path, game_dir: &Path, top: &Path, old: &Path) -> Result<(), String> {
     if old.exists() {
         fs::remove_dir_all(old).map_err(|e| format!("cannot clear {} (close any program using it): {e}", old.display()))?;
     }
@@ -410,7 +519,8 @@ pub fn install(install: &Path, top: &Path, old: &Path) -> Result<(), String> {
             // a table the package does not ship is not stale, it is theirs.
             if name.to_string_lossy().eq_ignore_ascii_case("locales") {
                 continue;
-            }            stale.extend(walk(&install.join(&name)).into_iter().map(|r| name.join(r)).filter(|r| !new_set.contains(r)));
+            }
+            stale.extend(walk(&install.join(&name)).into_iter().map(|r| name.join(r)).filter(|r| !new_set.contains(r)));
         }
     }
     // (relative path, the old file was moved to old/, a new file was moved in)
@@ -449,7 +559,7 @@ pub fn install(install: &Path, top: &Path, old: &Path) -> Result<(), String> {
         }
         Ok(())
     };
-    if let Err(e) = step() {
+    let rollback_pkg = |done: &[(PathBuf, bool, bool)]| {
         for (rel, had, placed) in done.iter().rev() {
             let target = install.join(rel);
             if *placed {
@@ -459,6 +569,13 @@ pub fn install(install: &Path, top: &Path, old: &Path) -> Result<(), String> {
                 let _ = rename_retry(&old.join(rel), &target);
             }
         }
+    };
+    if let Err(e) = step() {
+        rollback_pkg(&done);
+        return Err(format!("{e} Nothing was changed."));
+    }
+    if let Err(e) = sync_runtime_dlls(install, game_dir, old) {
+        rollback_pkg(&done);
         return Err(format!("{e} Nothing was changed."));
     }
     Ok(())
@@ -520,11 +637,20 @@ fn dir_changed(install: &Path, old_dir: &Path, rel_dir: &str, missing_or_list_re
     None
 }
 
-/// Whether the updated package requires running Set up again. Compares `xc2/`, `runtime/`, and the shader toolchain
-/// (`tools/spirv_harness/`, `tools/shader-cache/`, `tools/shader/`) against `update/old/` saved aside during `install()`.
+/// Whether the updated package requires running Set up again. When the package's manifest check is available,
+/// consults it directly so routine ABI-compatible `runtime/*.dll` updates already synced by `install()` do not
+/// trigger an unnecessary Set up. Otherwise falls back to comparing `xc2/`, `runtime/`, and the shader toolchain
+/// against `update/old/` saved aside during `install()`.
 pub fn rebuild_needed(install: &Path, game_dir: &Path) -> (Option<bool>, String) {
     if !game_dir.join("xc2_boot.exe").is_file() {
         return (Some(true), "xc2_boot.exe is not built yet".into());
+    }
+    if let Some(gate) = crate::setup::check_package_manifest_readonly(install, game_dir) {
+        return if gate.ok {
+            (Some(false), String::new())
+        } else {
+            (Some(true), gate.reason)
+        };
     }
     let old_dir = install.join(WORK).join("old");
     if !old_dir.is_dir() {
@@ -659,6 +785,61 @@ mod tests {
         assert_eq!(get(inst.join("tools/a.py")), "old a");
         assert_eq!(get(inst.join("tools/gone.py")), "stale");
         assert_eq!(get(inst.join("zz")), "a file where the new package has a folder");
+    }
+
+    #[test]
+    fn install_syncs_runtime_dlls_beside_boot_exe_and_preserves_player_dlls() {
+        // 1) Separate game_dir with existing xc2_boot.exe: runtime/*.dll sync beside it, stale runtime DLL removed,
+        //    player-added DLL kept, and temp backup folder cleaned up.
+        let (inst, game, top, old) = (tmp("sync-i1"), tmp("sync-g1"), tmp("sync-t1"), tmp("sync-o1").join("old"));
+        put(inst.join("runtime/xc2_rt.dll"), "rt-v1");
+        put(inst.join("runtime/avcodec-62.dll"), "ff-old");
+        put(game.join("xc2_boot.exe"), "exe");
+        put(game.join("xc2_rt.dll"), "rt-v1");
+        put(game.join("avcodec-62.dll"), "ff-old");
+        put(game.join("amd_fidelityfx_upscaler_vk.dll"), "player-fsr");
+        put(top.join("runtime/xc2_rt.dll"), "rt-v2");
+        put(top.join("runtime/avcodec-63.dll"), "ff-new");
+
+        install_with_game_dir(&inst, &game, &top, &old).unwrap();
+        assert_eq!(get(inst.join("runtime/xc2_rt.dll")), "rt-v2");
+        assert_eq!(get(game.join("xc2_rt.dll")), "rt-v2");
+        assert_eq!(get(game.join("avcodec-63.dll")), "ff-new");
+        assert!(!game.join("avcodec-62.dll").exists(), "obsolete shipped runtime DLL must be removed beside exe");
+        assert_eq!(get(game.join("amd_fidelityfx_upscaler_vk.dll")), "player-fsr", "player DLL must stay untouched");
+        assert!(!game.join(".update-old-dlls").exists());
+
+        // 2) Fresh install without xc2_boot.exe: runtime/*.dll must NOT be copied to root yet.
+        let (inst2, top2, old2) = (tmp("sync-i2"), tmp("sync-t2"), tmp("sync-o2").join("old"));
+        put(inst2.join("runtime/xc2_rt.dll"), "rt-v1");
+        put(top2.join("runtime/xc2_rt.dll"), "rt-v2");
+        install(&inst2, &top2, &old2).unwrap();
+        assert_eq!(get(inst2.join("runtime/xc2_rt.dll")), "rt-v2");
+        assert!(!inst2.join("xc2_rt.dll").exists());
+    }
+
+    #[test]
+    fn install_rolls_back_runtime_dlls_and_package_on_dll_sync_failure() {
+        let (inst, game, top, old) = (tmp("rb-dll-i"), tmp("rb-dll-g"), tmp("rb-dll-t"), tmp("rb-dll-o").join("old"));
+        put(inst.join("runtime/a_ok.dll"), "a-v1");
+        put(inst.join("runtime/z_fail.dll"), "z-v1");
+        put(inst.join("tools/a.py"), "tool-v1");
+        put(game.join("xc2_boot.exe"), "exe");
+        put(game.join("a_ok.dll"), "a-v1");
+        put(game.join("z_fail.dll"), "z-v1");
+        // Block z_fail.dll staging AFTER a_ok.dll has already been replaced, so we prove mid-sync rollback works.
+        put(game.join(".z_fail.dll.upd-new/blocker"), "dir-blocker");
+        put(top.join("runtime/a_ok.dll"), "a-v2");
+        put(top.join("runtime/z_fail.dll"), "z-v2");
+        put(top.join("tools/a.py"), "tool-v2");
+
+        assert!(install_with_game_dir(&inst, &game, &top, &old).is_err());
+        assert_eq!(get(inst.join("runtime/a_ok.dll")), "a-v1", "package runtime DLL must roll back");
+        assert_eq!(get(inst.join("runtime/z_fail.dll")), "z-v1", "package runtime DLL must roll back");
+        assert_eq!(get(inst.join("tools/a.py")), "tool-v1", "package tool must roll back");
+        assert_eq!(get(game.join("a_ok.dll")), "a-v1", "already-replaced game_dir DLL must roll back to v1");
+        assert_eq!(get(game.join("z_fail.dll")), "z-v1");
+        assert!(!game.join(".update-old-dlls").exists());
     }
 
     #[test]
