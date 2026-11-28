@@ -55,6 +55,7 @@ bool start(const StartOptions& opt);        // after nxrt::init, the renderer an
 void stop();                                // saves changed settings, removes the hooks and the input source
 void set_hud_callback(std::function<void(const gfx::HudCanvas&)> fn);   // optional foreground HUD drawn over the game frame
 uint64_t create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3_linear, size_t bytes);  // upload BC3 texture for HudCanvas::image
+uint64_t create_hud_texture_bc7(uint32_t w, uint32_t h, const void* bc7_linear, size_t bytes);  // upload BC7 texture (menu face atlas)
 void set_picker(gfx::PickerCallbacks cb);                                // optional searchable destination picker window (e.g. F4)
 void toggle_picker();                                                    // toggle destination picker window
 bool overlay_blocks_game();                 // true while the F1 overlay (or on-screen keyboard) wants keyboard/mouse/pad input

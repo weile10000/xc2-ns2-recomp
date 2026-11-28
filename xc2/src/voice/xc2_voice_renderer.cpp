@@ -24,6 +24,97 @@ struct PortraitUV {
     float u0 = 0.f, v0 = 0.f, u1 = 0.f, v1 = 0.f;
 };
 
+// speaker_id (the VoiceID column of common.bdat) -> /menu/image/face.wilay cell.
+// The atlas is 8x26 cells of 256x256: 0..15 are the story party in the atlas' own order, 16..63 the
+// blades, with the three Expansion Pass blades at 34..36. A speaker that is not listed falls back to
+// the Core Crystal monogram, which is the correct look for the generic blades (61..80).
+// Adding a blade is one line here and nothing else.
+struct FaceCell {
+    uint16_t speaker_id;
+    uint8_t cell;
+};
+
+constexpr FaceCell kFaceCells[] = {
+    // Drivers
+    {1, 8},    // 莱克斯 Rex
+    {2, 9},    // 尼娅 Nia
+    {3, 11},   // 虎 Tora
+    {4, 13},   // 凡达姆 Vandham
+    {5, 12},   // 梅勒芙 Morag
+    {6, 10},   // 齐格 Zeke
+    {7, 14},   // 真 Jin
+    {8, 15},   // 灭 Malos
+    // Story blades (cells 0..7 and the four companion blades at 24..27)
+    {11, 0},   // 焰 Pyra
+    {12, 1},   // 光 Mythra
+    {13, 2},   // 灵魂 Pneuma
+    {14, 4},   // 白虎 Dromarch
+    {15, 5},   // 花JS Poppi α
+    {16, 6},   // 花JK Poppi QT
+    {17, 7},   // 花JD Poppi QTπ
+    {18, 26},  // 朱雀 Roc
+    {19, 25},  // 迦具土 Brighid
+    {20, 24},  // 彩歌 Pandoria
+    {21, 3},   // 尼娅 (异刃)
+    // Torna organisation blades (cells 19, 28..31)
+    {22, 28},  // 斩铁
+    {23, 17},  // 义经
+    {24, 19},  // 弁庆
+    {25, 38},  // 佐田彦
+    {26, 31},  // 神威
+    {27, 30},  // 罗候
+    {28, 29},  // 大锤
+    // Rare blades
+    {31, 27},  // 绵津见 Aegaeon
+    {32, 16},  // 红莲 Godfrey
+    {35, 21},  // 雄黄 Wulfric
+    {34, 18},  // 婆娑罗
+    {36, 39},  // 宫比罗
+    {37, 22},  // 韦驮天 Boreas
+    {38, 20},  // 萤
+    {39, 23},  // 重音 Kasandra
+    {40, 40},  // 水分 Praxis
+    {41, 41},  // 星织 Theory
+    {42, 42},  // 时叶
+    {43, 43},  // 石榴
+    {44, 44},  // 蓟
+    {45, 45},  // 七冰
+    {46, 46},  // 纽兹
+    {47, 47},  // 宇迦
+    {48, 32},  // 凛音
+    {49, 33},  // 结
+    {50, 34},  // 式 Adenine
+    {51, 35},  // 雷鼓
+    {52, 36},  // 八重切 Zenobia
+    {53, 37},  // 伊吹
+};
+
+// speaker_id -> /menu/image/mnu_face.wilay cell (BC7, 8x12 of 192x192). The Expansion Pass blades and the
+// Switch 2 Edition additions have no cell in face.wilay at all, so this is the only portrait they have.
+constexpr FaceCell kMenuFaceCells[] = {
+    {54, 48},   // KOS-MOS Re:
+    {501, 49},  // 花巴斯塔 Poppibuster
+    {502, 51},  // 修尔克 Shulk
+    {503, 52},  // 菲奥伦 Fiora
+    {504, 53},  // 神八 Corvin
+    {505, 54},  // 火花 Crossette
+    {506, 55},  // 艾尔玛 Elma
+    {231, 60},  // MOMO 第一形态
+    {232, 63},  // MOMO 第二形态
+};
+
+int face_cell_for(uint16_t speaker_id) {
+    for (const FaceCell& e : kFaceCells)
+        if (e.speaker_id == speaker_id) return static_cast<int>(e.cell);
+    return -1;
+}
+
+int menu_face_cell_for(uint16_t speaker_id) {
+    for (const FaceCell& e : kMenuFaceCells)
+        if (e.speaker_id == speaker_id) return static_cast<int>(e.cell);
+    return -1;
+}
+
 struct PortraitAtlas {
     bool tried = false;
     uint64_t face_tex = 0;        // /menu/image/face.wilay (2048x6656, 8x26 cells of 256x256)
@@ -35,6 +126,9 @@ struct PortraitAtlas {
     uint64_t torna_tex = 0;       // /menu/image/dlc3_btl_face.wilay (2048x512, 8x2 cells of 256x256)
     uint32_t torna_cols = 8;
     uint32_t torna_rows = 2;
+    uint64_t mnu_face_tex = 0;    // /menu/image/mnu_face.wilay (1536x2304, BC7, 8x12 cells of 192x192)
+    uint32_t mnu_face_cols = 8;   // the Expansion Pass and Switch 2 Edition blades only have a portrait here
+    uint32_t mnu_face_rows = 12;
 
     static uint32_t rd32(const uint8_t* p) {
         uint32_t v = 0;
@@ -42,7 +136,8 @@ struct PortraitAtlas {
         return v;
     }
 
-    static bool untile_and_upload_wilay(const char* path, uint64_t& out_tex, uint32_t& out_cols, uint32_t& out_rows) {
+    static bool untile_and_upload_wilay(const char* path, uint32_t cell, uint64_t& out_tex, uint32_t& out_cols,
+                                       uint32_t& out_rows) {
         std::vector<uint8_t> raw;
         if (!xc2::nav::read_archive_file(path, raw) || raw.size() < 0x1040) return false;
         // Locate trailing LBIM footer (40 bytes at end of file)
@@ -52,7 +147,8 @@ struct PortraitAtlas {
         const uint32_t w      = rd32(lb + 0x08);
         const uint32_t h      = rd32(lb + 0x0C);
         const uint32_t fmt    = rd32(lb + 0x18);
-        if (fmt != 68u || w < 256u || h < 256u || (w & 3u) || (h & 3u)) return false;
+        // 68 = RGBA_DXT5 (BC3), 77 = BPTC_UNORM (BC7): the menu face atlas is the only BC7 one of the four.
+        if ((fmt != 68u && fmt != 77u) || w < cell || h < cell || (w & 3u) || (h & 3u)) return false;
         if (0x1000ull + img_sz > raw.size()) return false;
 
         const uint32_t bw = w / 4u;
@@ -90,10 +186,11 @@ struct PortraitAtlas {
             }
         }
 
-        out_tex = nxrt::play::create_hud_texture_bc3(w, h, lin.data(), lin.size());
+        out_tex = fmt == 77u ? nxrt::play::create_hud_texture_bc7(w, h, lin.data(), lin.size())
+                             : nxrt::play::create_hud_texture_bc3(w, h, lin.data(), lin.size());
         if (!out_tex) return false;
-        out_cols = w / 256u;
-        out_rows = h / 256u;
+        out_cols = w / cell;
+        out_rows = h / cell;
         NXLOG_I(kTag, "loaded portrait atlas %s (%ux%u, %ux%u cells)", path, w, h, out_cols, out_rows);
         return true;
     }
@@ -101,9 +198,10 @@ struct PortraitAtlas {
     void ensure_loaded() {
         if (tried) return;
         tried = true;
-        untile_and_upload_wilay("/menu/image/face.wilay", face_tex, face_cols, face_rows);
-        untile_and_upload_wilay("/menu/image/btl_face.wilay", btl_face_tex, btl_face_cols, btl_face_rows);
-        untile_and_upload_wilay("/menu/image/dlc3_btl_face.wilay", torna_tex, torna_cols, torna_rows);
+        untile_and_upload_wilay("/menu/image/face.wilay", 256u, face_tex, face_cols, face_rows);
+        untile_and_upload_wilay("/menu/image/btl_face.wilay", 256u, btl_face_tex, btl_face_cols, btl_face_rows);
+        untile_and_upload_wilay("/menu/image/dlc3_btl_face.wilay", 256u, torna_tex, torna_cols, torna_rows);
+        untile_and_upload_wilay("/menu/image/mnu_face.wilay", 192u, mnu_face_tex, mnu_face_cols, mnu_face_rows);
     }
 
     bool lookup(uint16_t speaker_id, bool rex_master_driver, PortraitUV& out) {
@@ -138,42 +236,28 @@ struct PortraitAtlas {
             out.v1 = static_cast<float>(row + 1) / static_cast<float>(torna_rows) - pad_v;
             return true;
         }
+        // Expansion Pass / Switch 2 Edition blades -> mnu_face.wilay (8x12 grid of 192x192, BC7).
+        // The artwork is a diamond inside each cell, so only its inscribed square is sampled (0.145 inset).
+        if (const int mc = menu_face_cell_for(speaker_id);
+            mc >= 0 && mnu_face_tex && mnu_face_cols > 0 && mnu_face_rows > 0) {
+            const uint32_t idx = static_cast<uint32_t>(mc);
+            const uint32_t col = idx % mnu_face_cols;
+            const uint32_t row = idx / mnu_face_cols;
+            if (row < mnu_face_rows) {
+                constexpr float kInset = 0.145f;
+                const float iu = kInset / static_cast<float>(mnu_face_cols);
+                const float iv = kInset / static_cast<float>(mnu_face_rows);
+                out.tex_id = mnu_face_tex;
+                out.u0 = static_cast<float>(col) / static_cast<float>(mnu_face_cols) + iu;
+                out.v0 = static_cast<float>(row) / static_cast<float>(mnu_face_rows) + iv;
+                out.u1 = static_cast<float>(col + 1) / static_cast<float>(mnu_face_cols) - iu;
+                out.v1 = static_cast<float>(row + 1) / static_cast<float>(mnu_face_rows) - iv;
+                return true;
+            }
+        }
         // Base game Drivers & Story/Rare Blades -> face.wilay (8x26 grid)
         if (!face_tex || face_cols == 0 || face_rows == 0) return false;
-        int cell = -1;
-        switch (speaker_id) {
-            // Drivers (Row 1)
-            case 1:  cell = 8;  break;  // 莱克斯 Rex
-            case 2:  cell = 9;  break;  // 尼娅 Nia
-            case 3:  cell = 11; break;  // 虎 Tora
-            case 4:  cell = 13; break;  // 范达姆 Vandham
-            case 5:  cell = 12; break;  // 梅勒芙 Morag
-            case 6:  cell = 10; break;  // 齐格 Zeke
-            case 7:  cell = 14; break;  // 真 Jin
-            case 8:  cell = 15; break;  // 灭 Malos
-            // Story Blades (Row 0 & Row 3)
-            case 11: cell = 0;  break;  // 焰 Pyra
-            case 12: cell = 1;  break;  // 光 Mythra
-            case 13: cell = 2;  break;  // 灵魂 Pneuma
-            case 14: cell = 4;  break;  // 白虎 Dromarch
-            case 15: cell = 5;  break;  // 花JS Poppi α
-            case 16: cell = 6;  break;  // 花JK Poppi QT
-            case 17: cell = 7;  break;  // 花JD Poppi QTπ
-            case 18: cell = 26; break;  // 朱雀 Roc
-            case 19: cell = 25; break;  // 迦具土 Brighid
-            case 20: cell = 24; break;  // 彩歌 Pandoria
-            case 21: cell = 3;  break;  // 尼娅 (异刃)
-            // Torna Org & Verified Rare Blades (Row 2 & 3)
-            case 23: cell = 17; break;  // 义经 Akhos
-            case 31: cell = 27; break;  // 绵津见 Aegaeon
-            case 32: cell = 16; break;  // 红莲 Godfrey
-            case 33: cell = 21; break;  // 力男 Gorg
-            case 35: cell = 18; break;  // 雄黄 Wulfric
-            case 37: cell = 22; break;  // 韦驮天 Boreas
-            case 39: cell = 23; break;  // 重音 Kasandra
-            case 49: cell = 20; break;  // 结 Electra
-            default: break;
-        }
+        int cell = face_cell_for(speaker_id);
         if (cell < 0) return false;
         const uint32_t col = static_cast<uint32_t>(cell) % face_cols;
         const uint32_t row = static_cast<uint32_t>(cell) / face_cols;

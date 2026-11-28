@@ -164,6 +164,9 @@ public:
     // Upload a linear BC3 (DXT5) texture for foreground HudCanvas::image / image_rounded (owned until Overlay shutdown).
     // Returns an opaque non-zero ImTextureID handle, or 0 on failure.
     uint64_t create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3_linear, size_t bytes);
+    // Upload a linear BC7 (BPTC) texture. The menu face atlas (/menu/image/mnu_face.wilay) is stored this way, so the
+    // DLC and Switch 2 Edition blades only have a portrait here.
+    uint64_t create_hud_texture_bc7(uint32_t w, uint32_t h, const void* bc7_linear, size_t bytes);
 
     // Optional searchable destination picker window (toggled independently of F1, e.g. F4).
     void set_picker(PickerCallbacks cb);
@@ -178,6 +181,8 @@ public:
 
 private:
     Overlay() = default;
+    // Shared body of create_hud_texture_bc3/bc7: vk_format is a VkFormat (kept as uint32_t so this header stays free of vulkan).
+    uint64_t create_hud_texture_bc(uint32_t w, uint32_t h, const void* linear, size_t bytes, uint32_t vk_format, const char* label);
     struct Impl;
     Impl* impl_ = nullptr;
 };

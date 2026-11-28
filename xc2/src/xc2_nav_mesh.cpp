@@ -191,8 +191,10 @@ bool load_arh_index(const std::filesystem::path& romfs_dir, ArhIndex& out) {
         const bool is_nav = (full.find(".winvhe") != std::string::npos || full.find(".winvda") != std::string::npos);
         const bool is_lvb = (full.find("_landmark.lvb") != std::string::npos || full.find("_npc.lvb") != std::string::npos);
         const bool is_gmk = (full == "/bdat/common_gmk.bdat");
+        // mnu_face.wilay is the BC7 menu face atlas: the Expansion Pass and Switch 2 Edition blades have no
+        // portrait in face.wilay, so the voice cards need it too.
         const bool is_face = (full == "/menu/image/face.wilay" || full == "/menu/image/dlc3_btl_face.wilay" ||
-                              full == "/menu/image/btl_face.wilay");
+                              full == "/menu/image/btl_face.wilay" || full == "/menu/image/mnu_face.wilay");
         if (!is_nav && !is_lvb && !is_gmk && !is_face) continue;
 
         const uint8_t* ep = ents + static_cast<size_t>(entry_idx) * 24;
