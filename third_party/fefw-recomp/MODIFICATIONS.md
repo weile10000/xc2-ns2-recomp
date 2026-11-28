@@ -21,6 +21,7 @@ This directory is a **modified fork** of `Goldoire/fefw-recomp` (the original Gi
 
 | `file` | date | change |
 |---|---|---|
+| `runtime/scripts/gen_taau_shaders.py` + `runtime/src/gfx/extras/{taau.h,taau.cpp,taau_shaders.inc}` + `runtime/src/gfx/nvn/api_dlss_replay.cpp` | 2026-11-28 | add `kTaauOpaqueAlphaComp` / `Taau::record_opaque_alpha()` to force `output.a = 1.0` after SDK upscaler dispatch (FSR 4.1.2 writes `alpha = 0.0`, causing `SRC_ALPHA` UI composite screens such as XC2 Blade Resonance to render 3D black; issue #96), and write `alpha = 1.0` in `kSpatial` (bilinear) mode |
 | `runtime/src/gfx/shaders/nav_ribbon.{vert,frag}` | 2026-11-27 | new: GLSL shaders for native Vulkan 3D translucent conveyor-belt navigation ribbon with read-only scene depth occlusion |
 | `runtime/src/gfx/extras/nav_ribbon.{h,cpp}` + `nav_ribbon_shaders.inc` | 2026-11-27 | new: `NavRibbonPass` dynamic-rendering Vulkan 3D ribbon pass (per-slot upload VB, depth sampler, SDR + HDR safe) |
 | `runtime/include/nxrt/gfx.h` + `runtime/src/gfx/vk_renderer.cpp` | 2026-11-27 | pass optional per-frame read-only 3D scene depth view/layout/flip_y/depth_mode into `FrameInfo` for overlay depth occlusion |

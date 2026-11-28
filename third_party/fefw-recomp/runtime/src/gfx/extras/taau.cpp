@@ -98,7 +98,7 @@ bool Taau::init() {
         li.pBindings = b;
         return vkCreateDescriptorSetLayout(d, &li, nullptr, out) == VK_SUCCESS;
     };
-    if (!make_layout(5, 1, &set_layout_) || !make_layout(3, 3, &prep_set_layout_)) return false;
+    if (!make_layout(5, 1, &set_layout_) || !make_layout(3, 3, &prep_set_layout_) || !make_layout(0, 1, &alpha_set_layout_)) return false;
 
     auto make_pipe = [&](VkDescriptorSetLayout sl, uint32_t push, const uint32_t* code, size_t code_size, VkPipelineLayout* pl, VkPipeline* pipe) {
         VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, push};
@@ -121,22 +121,26 @@ bool Taau::init() {
         return r == VK_SUCCESS;
     };
     return make_pipe(set_layout_, sizeof(TaauPush), kTaauComp, sizeof(kTaauComp), &layout_, &pipe_) &&
-           make_pipe(prep_set_layout_, sizeof(PrepPush), kTaauPrepComp, sizeof(kTaauPrepComp), &prep_layout_, &prep_pipe_);
+           make_pipe(prep_set_layout_, sizeof(PrepPush), kTaauPrepComp, sizeof(kTaauPrepComp), &prep_layout_, &prep_pipe_) &&
+           make_pipe(alpha_set_layout_, 8, kTaauOpaqueAlphaComp, sizeof(kTaauOpaqueAlphaComp), &alpha_layout_, &alpha_pipe_);
 }
 
 void Taau::destroy() {
     VkDevice d = dev_->device();
     if (pipe_) vkDestroyPipeline(d, pipe_, nullptr);
     if (prep_pipe_) vkDestroyPipeline(d, prep_pipe_, nullptr);
+    if (alpha_pipe_) vkDestroyPipeline(d, alpha_pipe_, nullptr);
     if (layout_) vkDestroyPipelineLayout(d, layout_, nullptr);
     if (prep_layout_) vkDestroyPipelineLayout(d, prep_layout_, nullptr);
+    if (alpha_layout_) vkDestroyPipelineLayout(d, alpha_layout_, nullptr);
     if (set_layout_) vkDestroyDescriptorSetLayout(d, set_layout_, nullptr);
     if (prep_set_layout_) vkDestroyDescriptorSetLayout(d, prep_set_layout_, nullptr);
+    if (alpha_set_layout_) vkDestroyDescriptorSetLayout(d, alpha_set_layout_, nullptr);
     if (nearest_) vkDestroySampler(d, nearest_, nullptr);
     if (linear_) vkDestroySampler(d, linear_, nullptr);
-    pipe_ = prep_pipe_ = VK_NULL_HANDLE;
-    layout_ = prep_layout_ = VK_NULL_HANDLE;
-    set_layout_ = prep_set_layout_ = VK_NULL_HANDLE;
+    pipe_ = prep_pipe_ = alpha_pipe_ = VK_NULL_HANDLE;
+    layout_ = prep_layout_ = alpha_layout_ = VK_NULL_HANDLE;
+    set_layout_ = prep_set_layout_ = alpha_set_layout_ = VK_NULL_HANDLE;
     nearest_ = linear_ = VK_NULL_HANDLE;
 }
 
@@ -214,6 +218,22 @@ void Taau::record_prep(VkCommandBuffer cb, VkDescriptorSet set, const TaauPrepFr
     vkCmdPushConstants(cb, prep_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
     const uint32_t w0 = static_cast<uint32_t>(f.in_size[0]), h0 = static_cast<uint32_t>(f.in_size[1]);
     vkCmdDispatch(cb, (w0 + 7) / 8, (h0 + 7) / 8, 1);
+}
+
+void Taau::record_opaque_alpha(VkCommandBuffer cb, VkDescriptorSet set, VkImageView img, VkExtent2D size) {
+    const VkDescriptorImageInfo ii = {VK_NULL_HANDLE, img, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set;
+    w.dstBinding = 0;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w.pImageInfo = &ii;
+    vkUpdateDescriptorSets(dev_->device(), 1, &w, 0, nullptr);
+    const uint32_t dims[2] = {size.width, size.height};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, alpha_pipe_);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, alpha_layout_, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cb, alpha_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof dims, dims);
+    vkCmdDispatch(cb, (size.width + 7) / 8, (size.height + 7) / 8, 1);
 }
 
 }  // namespace nxrt::extras

@@ -59,10 +59,13 @@ public:
 
     VkDescriptorSetLayout set_layout() const { return set_layout_; }
     VkDescriptorSetLayout prep_set_layout() const { return prep_set_layout_; }
-    // Record into cb, outside any render pass. `set` is a set of set_layout() / prep_set_layout() that lives until the GPU has run cb. The
+    VkDescriptorSetLayout alpha_set_layout() const { return alpha_set_layout_; }
+    // Record into cb, outside any render pass. `set` is a set of set_layout() / prep_set_layout() / alpha_set_layout() that lives until the GPU has run cb. The
     // caller orders the inputs' writes before the pass and the outputs' readers after it.
     void record(VkCommandBuffer cb, VkDescriptorSet set, const TaauFrame& f);
     void record_prep(VkCommandBuffer cb, VkDescriptorSet set, const TaauPrepFrame& f);
+    // Force alpha = 1.0 in place on an rgba16f storage image in GENERAL layout (SDK upscalers such as FSR 4.1.2 write alpha = 0.0).
+    void record_opaque_alpha(VkCommandBuffer cb, VkDescriptorSet set, VkImageView img, VkExtent2D size);
 
 private:
     explicit Taau(gfx::Device& dev) : dev_(&dev) {}
@@ -70,9 +73,9 @@ private:
     void destroy();
     gfx::Device* dev_;
     VkSampler nearest_ = VK_NULL_HANDLE, linear_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE, prep_set_layout_ = VK_NULL_HANDLE;
-    VkPipelineLayout layout_ = VK_NULL_HANDLE, prep_layout_ = VK_NULL_HANDLE;
-    VkPipeline pipe_ = VK_NULL_HANDLE, prep_pipe_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE, prep_set_layout_ = VK_NULL_HANDLE, alpha_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout layout_ = VK_NULL_HANDLE, prep_layout_ = VK_NULL_HANDLE, alpha_layout_ = VK_NULL_HANDLE;
+    VkPipeline pipe_ = VK_NULL_HANDLE, prep_pipe_ = VK_NULL_HANDLE, alpha_pipe_ = VK_NULL_HANDLE;
 };
 
 }  // namespace nxrt::extras

@@ -634,6 +634,14 @@ bool run_sdk(Frame& f, Upscaler u, NetGpu& n, const DlssEval& e, const extras::T
     for (float* m : {tf.view_to_clip, tf.clip_to_view, tf.clip_to_prev_clip, tf.prev_clip_to_clip}) std::memcpy(m, kIdentity, sizeof kIdentity);
     if (!be->evaluate(f.cb, tf)) return false;
     gpu::memory_barrier(f.cb);
+    // SDK upscalers (notably FSR 4.1.2, issue #96) may leave output.a = 0.0. XC2's DLSS output
+    // texture is RGBA8 and screens like Blade Resonance composite it onto a black swapchain with
+    // SRC_ALPHA, turning the 3D scene completely black while UI renders on top. Force alpha = 1.0
+    // before blit_out().
+    if (VkDescriptorSet aset = f.alloc_set(t->alpha_set_layout())) {
+        t->record_opaque_alpha(f.cb, aset, n.sdk[3].img.view, out);
+        gpu::memory_barrier(f.cb);
+    }
     return true;
 }
 
