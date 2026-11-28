@@ -309,9 +309,154 @@ fn engine_status(p: &Paths) -> (std::collections::HashMap<String, String>, Strin
     (map, v["state"].as_str().unwrap_or("").to_string(), v["step"].as_str().unwrap_or("").to_string())
 }
 
+/// Outcome of checking `<game_dir>/build/install-manifest.json` and synced `runtime/*.dll` against the current package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestGate {
+    pub ok: bool,
+    pub upgrade_needed: bool,
+    pub stale_steps: Vec<String>,
+    pub reason: String,
+}
+
+impl Default for ManifestGate {
+    fn default() -> Self {
+        Self { ok: true, upgrade_needed: false, stale_steps: Vec::new(), reason: String::new() }
+    }
+}
+
+type FileStamp = (Option<std::time::SystemTime>, u64);
+type ManifestCacheKey = (PathBuf, PathBuf, FileStamp, FileStamp, FileStamp, FileStamp, FileStamp, FileStamp);
+static MANIFEST_GATE_CACHE: Mutex<Option<(ManifestCacheKey, ManifestGate)>> = Mutex::new(None);
+
+pub fn invalidate_manifest_cache() {
+    *MANIFEST_GATE_CACHE.lock().unwrap() = None;
+}
+
+fn quick_stamp(p: &Path) -> FileStamp {
+    fs::metadata(p).map(|m| (m.modified().ok(), m.len())).unwrap_or((None, 0))
+}
+
+fn manifest_cache_key(repo: &Path, game_dir: &Path) -> ManifestCacheKey {
+    (
+        repo.to_path_buf(),
+        game_dir.to_path_buf(),
+        quick_stamp(&game_dir.join("build").join("install-manifest.json")),
+        quick_stamp(&game_dir.join("setup").join("status.json")),
+        quick_stamp(&game_dir.join("xc2_boot.exe")),
+        quick_stamp(&repo.join("runtime").join("xc2_rt.dll")),
+        quick_stamp(&game_dir.join("xc2_rt.dll")),
+        quick_stamp(&repo.join("tools").join("spirv_harness")),
+    )
+}
+
+fn mcpu_for_setup() -> Option<&'static str> {
+    match crate::cpu::build_variant() {
+        Some("fma") => Some("x86_64+cx16+fma"),
+        Some("compat") => Some("x86_64+cx16+sse4_2+popcnt"),
+        _ => None,
+    }
+}
+
+fn engine_script_for_repo(repo: &Path) -> PathBuf {
+    let in_repo = repo.join("engine").join("xc2_setup.py");
+    if in_repo.is_file() {
+        return in_repo;
+    }
+    engine_script(repo)
+}
+
+pub(crate) fn parse_manifest_gate_json(text: &str) -> Option<ManifestGate> {
+    let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let ok = v.get("ok")?.as_bool()?;
+    let upgrade_needed = v.get("upgrade_needed").and_then(|x| x.as_bool()).unwrap_or(!ok);
+    let stale_steps = v
+        .get("stale_steps")
+        .and_then(|x| x.as_array())
+        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let reason = v.get("reason").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    Some(ManifestGate { ok, upgrade_needed, stale_steps, reason })
+}
+
+fn run_manifest_check(py: &Path, engine: &Path, repo: &Path, game_dir: &Path, seed_legacy: bool) -> Option<ManifestGate> {
+    if !py.is_file() || !engine.is_file() {
+        return None;
+    }
+    let mut cmd = Command::new(py);
+    cmd.arg("-u")
+        .arg(engine)
+        .arg("--check-manifest")
+        .arg("--repo")
+        .arg(repo)
+        .arg("--install")
+        .arg(game_dir);
+    if let Some(mcpu) = mcpu_for_setup() {
+        cmd.arg("--cpu").arg(mcpu);
+    }
+    if seed_legacy {
+        cmd.arg("--seed-legacy");
+    }
+    quiet(&mut cmd);
+    let out = cmd.stdin(Stdio::null()).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_manifest_gate_json(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Read-only package manifest check for `update::rebuild_needed`. Returns `None` when the package tools are absent.
+pub fn check_package_manifest_readonly(install: &Path, game_dir: &Path) -> Option<ManifestGate> {
+    let tools = install.join("tools");
+    let py = package_python(&tools);
+    let engine = engine_script_for_repo(install);
+    if !py.is_file() || !engine.is_file() {
+        return None;
+    }
+    run_manifest_check(&py, &engine, install, game_dir, false)
+}
+
+/// Package manifest gate: checks whether an already-built package install matches the current package's lift, link
+/// (ABI + stub + synced runtime DLLs), and shader/prefill inputs. Checkout builds and not-yet-built installs pass
+/// through unchanged. Cached across repeated `setup_status` polls and invalidated after setup or update runs.
+pub fn manifest_gate(p: &Paths) -> ManifestGate {
+    let Some(_) = &p.package else {
+        return ManifestGate::default();
+    };
+    let status_done = engine_status(p).1 == "done";
+    if !status_done {
+        return ManifestGate::default();
+    }
+    if !p.exe().is_file() {
+        return ManifestGate {
+            ok: false,
+            upgrade_needed: false,
+            stale_steps: vec!["link".into()],
+            reason: "xc2_boot.exe is not built yet".into(),
+        };
+    }
+    let key = manifest_cache_key(&p.repo, &p.game_dir);
+    if let Some((k, cached)) = MANIFEST_GATE_CACHE.lock().unwrap().as_ref() {
+        if *k == key {
+            return cached.clone();
+        }
+    }
+    let engine = engine_script_for_repo(&p.repo);
+    let gate = run_manifest_check(&p.python(), &engine, &p.repo, &p.game_dir, true).unwrap_or_else(|| ManifestGate {
+        ok: false,
+        upgrade_needed: true,
+        stale_steps: vec!["link".into()],
+        reason: "could not verify install manifest".into(),
+    });
+    // Re-snapshot key after optional legacy seeding so the written install-manifest.json stays a cache hit.
+    let final_key = manifest_cache_key(&p.repo, &p.game_dir);
+    *MANIFEST_GATE_CACHE.lock().unwrap() = Some((final_key, gate.clone()));
+    gate
+}
+
 /// What the engine says is done already, step by step (the page's checklist).
 pub fn steps(p: &Paths, running: Option<&str>) -> Vec<StepState> {
     let (states, _, current) = engine_status(p);
+    let gate = if running.is_none() { manifest_gate(p) } else { ManifestGate::default() };
     // A package runs five steps, a checkout seven: showing the checkout's list in a package leaves "Fetch the build
     // sources" and "Build the runtime"永远 to do, which is what made a finished setup look unfinished.
     let ids: Vec<&str> = if p.package.is_some() {
@@ -321,7 +466,9 @@ pub fn steps(p: &Paths, running: Option<&str>) -> Vec<StepState> {
     };
     ids.iter()
         .map(|id| {
+            let stale_by_gate = !gate.ok && (gate.stale_steps.iter().any(|s| s == id) || *id == "done");
             let state = match states.get(*id).map(|s| s.as_str()) {
+                Some("done") if stale_by_gate => "todo",
                 Some("done") => "done",
                 Some("failed") => "error",
                 _ if current == *id || running == Some(*id) => "running",
@@ -333,7 +480,7 @@ pub fn steps(p: &Paths, running: Option<&str>) -> Vec<StepState> {
 }
 
 pub fn complete(p: &Paths) -> bool {
-    engine_status(p).1 == "done"
+    engine_status(p).1 == "done" && manifest_gate(p).ok
 }
 
 /// A program started from the AppImage gets the host's environment, not the AppImage's: its AppRun points PYTHONHOME, GTK_*,
@@ -905,8 +1052,10 @@ fn run_steps(r: &Runner, p: &Paths, _jobs: usize) -> Result<bool, String> {
         c.env("XC2_AOC_DIR", dlc);
     }
     if !r.run("setup", "Setting up...", c, &p.repo)? {
+        invalidate_manifest_cache();
         return Ok(false);
     }
+    invalidate_manifest_cache();
     Ok(complete(p))
 }
 
@@ -1026,5 +1175,46 @@ mod tests {
         assert_eq!(ninja_progress("[ 3/ 9] x"), Some((3, 9)));
         assert_eq!(ninja_progress("no"), None);
         assert_eq!(tool_progress("scan: 5 10"), Some((5, 10)));
+    }
+
+    #[test]
+    fn manifest_gate_json_parsing_and_missing_exe_gate() {
+        let ok = parse_manifest_gate_json(r#"{"ok":true,"upgrade_needed":false,"stale_steps":[],"reason":""}"#).unwrap();
+        assert!(ok.ok && !ok.upgrade_needed && ok.stale_steps.is_empty());
+
+        let stale = parse_manifest_gate_json(
+            r#"{"ok":false,"upgrade_needed":true,"stale_steps":["link","shaders"],"reason":"runtime DLLs out of sync (xc2_rt.dll)"}"#,
+        )
+        .unwrap();
+        assert!(!stale.ok && stale.upgrade_needed);
+        assert_eq!(stale.stale_steps, vec!["link".to_string(), "shaders".to_string()]);
+        assert!(stale.reason.contains("xc2_rt.dll"));
+        assert!(parse_manifest_gate_json("not json").is_none());
+
+        // Package install whose status.json says "done" but xc2_boot.exe is missing must fail complete() and mark link+done todo.
+        let root = std::env::temp_dir().join(format!("xc2-gate-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let setup_dir = root.join("setup");
+        fs::create_dir_all(&setup_dir).unwrap();
+        fs::write(
+            setup_dir.join("status.json"),
+            r#"{"state":"done","step":"","steps":[{"name":"doctor","state":"done"},{"name":"ingest","state":"done"},{"name":"lift","state":"done"},{"name":"link","state":"done"},{"name":"shaders","state":"done"},{"name":"done","state":"done"}]}"#,
+        )
+        .unwrap();
+        let p = Paths {
+            repo: root.clone(),
+            exefs: root.join("exefs"),
+            romfs: root.join("romfs"),
+            dlc: None,
+            game_dir: root.clone(),
+            package: Some(root.join("tools")),
+        };
+        invalidate_manifest_cache();
+        assert!(!complete(&p), "missing xc2_boot.exe must fail complete()");
+        let st = steps(&p, None);
+        assert_eq!(st.iter().find(|s| s.id == "link").unwrap().state, "todo");
+        assert_eq!(st.iter().find(|s| s.id == "done").unwrap().state, "todo");
+        assert_eq!(st.iter().find(|s| s.id == "shaders").unwrap().state, "done");
+        let _ = fs::remove_dir_all(&root);
     }
 }

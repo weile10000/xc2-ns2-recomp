@@ -39,6 +39,7 @@ export const en = {
     'common.complete': 'complete',
     'common.built': 'built',
     'common.todo': 'to do: {list}',
+    'common.upgradeNeeded': 'upgrade pending: {list}',
 
     // ----- play -----
     'play.title': 'Play',
@@ -61,6 +62,10 @@ export const en = {
     'play.problemBadDump': 'The game files at {path} are not usable: {errors}',
     'play.problemSetupRunning': 'Setup is still running.',
     'play.problemSetupUnfinished': 'Setup is not finished yet: open Setup and press Set up.',
+    'play.upgradeBanner': 'This package was updated and needs an incremental Setup pass before playing (existing build and shader cache are kept).',
+    'play.upgradeBannerWithReason': 'This package was updated ({reason}). Run Finish upgrade to update only the changed parts before playing.',
+    'play.finishUpgrade': 'Finish upgrade',
+    'play.upgradePending': 'Upgrade pending',
     'play.openSetup': 'Open Setup',
     'play.chooseFiles': 'Choose game files',
     'play.install': 'Install',
@@ -216,6 +221,7 @@ export const en = {
     'setup.toolsAllFound': 'Everything was found.',
     'setup.checkAgain': 'Check again',
     'setup.continueSetup': 'Continue setup',
+    'setup.finishUpgrade': 'Finish upgrade',
     'setup.setUp': 'Set up',
     'setup.progressDone': '{done} of {total}. ',
     'setup.pauseHint': 'Pause stops the tools; finished work is kept and Set up continues from there.',

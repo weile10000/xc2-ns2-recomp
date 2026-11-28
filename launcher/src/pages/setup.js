@@ -71,18 +71,25 @@ function stepsHtml(s) {
   const pct = total ? Math.floor((100 * done) / total) : 0;
   const runningStep = s.steps.find((x) => x.state === 'running');
   const message = p.message || (runningStep ? stepTitle(runningStep) : '');
-  const label = s.complete ? t('setup.checkAgain') : s.steps.some((x) => x.state === 'done') ? t('setup.continueSetup') : t('setup.setUp');
+  const label = s.complete
+    ? t('setup.checkAgain')
+    : s.upgrade_needed
+      ? t('setup.finishUpgrade')
+      : s.steps.some((x) => x.state === 'done')
+        ? t('setup.continueSetup')
+        : t('setup.setUp');
   const stepIcon = (x) => (x.state === 'done' ? 'circle-check' : x.state === 'running' ? 'loader-circle' : 'circle');
   return `
     <div class="card" id="steps-card">
       <h2>${icon('hammer')}${esc(t('setup.setUp'))}</h2>
       <div class="stack">
         <ul class="steps">${s.steps.map((x) => `<li class="${x.state}">${icon(stepIcon(x), x.state === 'running' ? 'spin' : '')}${esc(stepTitle(x))}</li>`).join('')}</ul>
+        ${!running && s.upgrade_needed && p.state !== 'error' ? `<div class="banner warn">${icon('circle-arrow-up')}<div>${esc(s.upgrade_reason ? t('play.upgradeBannerWithReason', { reason: s.upgrade_reason }) : t('play.upgradeBanner'))}</div></div>` : ''}
         ${running ? `<p class="dim">${esc(progressMsg(message))}</p><progress max="100" value="${pct}"></progress>
           <p class="faint">${esc(t('setup.progressDone', { done, total }) + t('setup.pauseHint'))}</p>` : ''}
         ${p.state === 'error' ? `<div class="banner danger">${icon('circle-x')}<div style="white-space: pre-wrap">${esc(progressMsg(p.message))}</div></div>` : ''}
         ${p.state === 'cancelled' || p.state === 'done' ? `<p class="dim">${esc(progressMsg(p.message))}</p>` : ''}
-        ${!running && !s.complete && p.state !== 'error' ? `<p class="faint">${esc(t('setup.firstRunHint', { jobs: s.jobs }))}</p>` : ''}
+        ${!running && !s.complete && !s.upgrade_needed && p.state !== 'error' ? `<p class="faint">${esc(t('setup.firstRunHint', { jobs: s.jobs }))}</p>` : ''}
         <div class="row">
           ${running
             ? `<button class="btn" id="setup-cancel">${icon('circle-x')}${esc(t('setup.pause'))}</button>`

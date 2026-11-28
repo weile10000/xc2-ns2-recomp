@@ -38,6 +38,7 @@ export const zh = {
     'common.complete': '已完成',
     'common.built': '已构建',
     'common.todo': '待完成：{list}',
+    'common.upgradeNeeded': '待完成升级：{list}',
 
     // ----- 游玩 -----
     'play.title': '游玩',
@@ -60,6 +61,10 @@ export const zh = {
     'play.problemBadDump': '{path} 处的游戏文件不可用：{errors}',
     'play.problemSetupRunning': '构建仍在进行中。',
     'play.problemSetupUnfinished': '构建尚未完成：打开「构建」页并按「开始构建」。',
+    'play.upgradeBanner': '当前安装与新版程序包尚未对齐，请先点击「完成升级」补齐变动部分（已有构建与着色器缓存会保留）。',
+    'play.upgradeBannerWithReason': '当前安装与新版程序包尚未对齐（{reason}），请先点击「完成升级」仅补齐变动部分后再游玩。',
+    'play.finishUpgrade': '完成升级',
+    'play.upgradePending': '待完成升级',
     'play.openSetup': '打开构建页',
     'play.chooseFiles': '选择游戏文件',
     'play.install': '安装',
@@ -215,6 +220,7 @@ export const zh = {
     'setup.toolsAllFound': '全部已找到。',
     'setup.checkAgain': '重新检查',
     'setup.continueSetup': '继续构建',
+    'setup.finishUpgrade': '完成升级',
     'setup.setUp': '开始构建',
     'setup.progressDone': '{done} / {total}。',
     'setup.pauseHint': '暂停会停止工具进程；已完成的工作会保留，再次按「开始构建」会从那里继续。',
