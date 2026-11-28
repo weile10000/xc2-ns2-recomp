@@ -1,8 +1,10 @@
 # XC2 Voice Subtitle Localization Glossary & Style Guide
 
 Used as the authoritative terminology & persona constraint when translating extracted XC2 voice lines
-from dual-source audio (`jp.pck` + `en.pck`) into all 11 supported languages (`zh_cn`, `zh_tw`, `ja`,
+from dual-source audio (`jp.pck` + `en.pck`) into all 11 supported languages (`zh_hans`, `zh_hant`, `ja`,
 `en`, `ko`, `fr`, `de`, `es`, `it`, `nl`, `ru`).
+
+> Language codes are `zh_hans` / `zh_hant` throughout; never write the CN/TW pair (DECISIONS §456).
 
 ## 1. Core Tone & Style (简中 / 繁中)
 - **异度神剑2 官方传统语感**：热血少年 JRPG 气质 + 适度中二与戏剧张力，避免机翻腔与现代网络烂梗。
@@ -11,7 +13,7 @@ from dual-source audio (`jp.pck` + `en.pck`) into all 11 supported languages (`z
   - `text_full`（探索 & 战后相声底栏）：完整还原角色口癖与吐槽节奏。
 
 ## 2. Official Combat Terminology (严禁乱译)
-| Concept | 简中 (`zh_cn`) | 繁中 (`zh_tw`) | 日文 (`ja`) | 英文 (`en`) |
+| Concept | 简中 (`zh_hans`) | 繁中 (`zh_hant`) | 日文 (`ja`) | 英文 (`en`) |
 |---|---|---|---|---|
 | Driver | 御刃者 | 神劍使 | ドライバー | Driver |
 | Blade | 异刃 | 神劍 | ブレイド | Blade |
@@ -59,6 +61,19 @@ from dual-source audio (`jp.pck` + `en.pck`) into all 11 supported languages (`z
 - `31` 绵津见 / `32` 红莲 / `33` 力男 / `34` 婆娑罗 / `35` 雄黄 / `36` 宫比罗 / `37` 韦驮天 / `38` 萤 / `39` 重音 / `40` 水分
 - `41` 星织 / `42` 时叶 / `43` 石榴 / `44` 蓟 / `45` 七冰 / `46` 纽兹 / `47` 宇迦 / `48` 凛音 / `49` 结 / `50` 式
 - `51` 雷鼓 / `52` 八重切 / `53` 伊吹 / `54` KOS-MOS Re: / `55` 天威 / `56` 鸣 / `57` 玛瑙 / `58` 月 / `59` T-elos Re:
+
+### Switch 2 Edition 追加 (`231`–`232`)
+
+同一机体的两种形态，语气差别是刻意做出来的对照，不要混用：
+
+- **MOMO 第一形态 (`231`)**：礼貌的机械少女，**全程敬语**，自称「摩摩」，称呼他人一律「〜さん」。
+  战斗用语偏系统播报（「戦闘態勢に移行します」「戦闘プロトコルを起動します」），态度谦逊认真，
+  失误时会自责（「お役に立てなくてごめんなさい」）。
+- **MOMO 第二形态 (`232`)**：同一机体解锁后的熟络版本，语气**随性带小傲娇**，仍自称「摩摩」但改用
+  「〜だよ／〜よね」口语体。对同伴半开玩笑地提醒、偶尔拆台。
+
+> 与花JS→花JD 的进化关系同构：前者礼貌克制，后者熟络强硬。
+> 日文原文里 232 用汉字「桃」自称（「桃の力」），但那在中文里会变成另一个名字，**两个形态统一译「摩摩」**。
 
 ### 6 DLC 异刃 (`501`–`506`)
 - `501` 花巴斯塔 / `502` 修尔克 / `503` 菲奥伦 / `504` 神八 / `505` 火花 / `506` 艾尔玛

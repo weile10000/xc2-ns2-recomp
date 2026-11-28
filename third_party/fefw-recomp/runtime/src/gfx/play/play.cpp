@@ -1660,6 +1660,11 @@ uint64_t create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3_linear, 
     return st.overlay ? st.overlay->create_hud_texture_bc3(w, h, bc3_linear, bytes) : 0;
 }
 
+uint64_t create_hud_texture_bc7(uint32_t w, uint32_t h, const void* bc7_linear, size_t bytes) {
+    G& st = g();
+    return st.overlay ? st.overlay->create_hud_texture_bc7(w, h, bc7_linear, bytes) : 0;
+}
+
 void set_external_mouse_capture(bool on) {
     const bool was = g_external_mouse.exchange(on, std::memory_order_relaxed);
     // Hand the pointer back cleanly on the way out: the caller captures it again on its own terms.

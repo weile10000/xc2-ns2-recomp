@@ -448,6 +448,29 @@ def finalize_m3_state(r, install):
             ini_path.write_text("".join(out), encoding="utf-8")
 
 
+def code_patch_mods(install):
+    """The mods whose code patches are compiled into this install's xc2_boot.exe, or [] when there are none.
+
+    A wrong code patch - a Switch 1 cheat whose addresses were never ported, which is the common case - yields a
+    binary that dies on start-up. The headless prefill is the first thing to run that binary, so the failure lands on
+    the shaders step and reads like a graphics fault. Naming the mods is what turns it into something a player can
+    act on (issue #75).
+    """
+    state = Path(install) / "build" / "exefs-patched" / "m3_state.json"
+    if not state.is_file():
+        return []
+    try:
+        applied = json.loads(state.read_text(encoding="utf-8")).get("applied") or []
+    except (OSError, ValueError):
+        return []
+    mods = []
+    for entry in applied:
+        name = str(entry.get("mod") or str(entry.get("source", "")).split(":", 1)[0]).strip()
+        if name and name not in mods:
+            mods.append(name)
+    return mods
+
+
 def step_lift(r, repo, install, jobs=0):
     started = r.step("lift")
     exefs_dir = prepare_patched_exefs(r, repo, install)
@@ -1168,8 +1191,12 @@ def step_shaders_package(r, repo, install, py, jobs):
     note = prefill_package(r, repo, install, py, harness, spirv, jobs=jobs)
     r.log("  %d shader(s) in the cache" % len(list(spirv.glob("*.spv"))))
     if not prefilled.is_file():
-        return r.end_step("shaders", started, False,
-                          note or "the headless prefill named no block; the cache has the archive's share only")
+        note = note or "the headless prefill named no block; the cache has the archive's share only"
+        mods = code_patch_mods(install)
+        if mods:
+            note += ("; code patches from %s are compiled into this build - disable the mod and run Set up again "
+                     "if the patch was written for another build" % ", ".join(mods))
+        return r.end_step("shaders", started, False, note)
     if not r.dry and sig is not None:
         prefill_stamp.parent.mkdir(parents=True, exist_ok=True)
         prefill_stamp.write_text(json.dumps(sig), encoding="utf-8")
@@ -1373,7 +1400,10 @@ def prefill_package(r, repo, install, py, harness, spirv, seconds=40, jobs=0):
                 r.log("  prefill: " + hint)
             r.log("  prefill: the run's own log: %s" % log)
             how = "exited with code %d" % finished if (finished is not None and finished != 0) else "was stopped"
-            return "the headless prefill %s after %.0f s without naming a block: %s" % (how, seconds, short or reason[:96] or hint[:96])
+            # The cap is how long the pass may run, not how long it did: a run that died 2 s in was reported as
+            # "after 40 s", which reads like a timeout and hides that it crashed on start-up (issue #75).
+            ran = max(0.0, time.time() - started_wait)
+            return "the headless prefill %s after %.0f s without naming a block: %s" % (how, ran, short or reason[:96] or hint[:96])
         retype_ds_samplers(r, repo, py, spirv, log)
         prefilled.write_text("0 collected: nothing was missing\n", encoding="utf-8")
         return ""

@@ -29,11 +29,18 @@ MAIN_SPEAKERS = (
     + list(range(22, 29))                  # Torna Org Blades (22..28)
     + list(range(31, 60))                  # 29 Rare Blades (31..59)
     + list(range(501, 507))                # 6 DLC Blades (501..506)
+    + [231, 232]                           # Switch 2 Edition additions (MOMO, MOMO (i))
 )
 IRA_SPEAKERS = list(range(701, 710))       # Torna: The Golden Country 9 Playable Heroes
 
 GRUNT_KK = {6, 38, 50}
 BANTER_KK = {44}
+
+# Most events are named voice_<sp><kk><nn><vv>_play, but a few characters store every line under a one-letter
+# variant suffix instead: Hana JS (VoiceID 15) has 1 bare event and ~266 under "a"/"b"/"c", and the Switch 2
+# Edition pair 231/232 have a handful each. Scanning only the bare name made Hana JS look like she had almost no
+# voice at all (measured 2026-11-28: bare=1, a=131, b=135, c=2). Keep "" first so a bare hit stays canonical.
+VOICE_SUFFIXES = ("", "a", "b", "c")
 
 
 def fnv_step(h: int, bs: bytes) -> int:
@@ -141,6 +148,7 @@ def scan_speaker_events(speakers: list[int], pack_tag: str, jp_ctx, en_ctx,
     base_h = fnv_step(2166136261, b"voice_")
     play_bs = b"_play"
     d2 = [f"{i:02d}".encode() for i in range(100)]
+    suf_bs = [s.encode() for s in VOICE_SUFFIXES]
 
     entries = []
     for sp in speakers:
@@ -151,31 +159,35 @@ def scan_speaker_events(speakers: list[int], pack_tag: str, jp_ctx, en_ctx,
             for nn in range(0, 40):
                 h_nn = fnv_step(h_kk, d2[nn])
                 for vv in range(0, 100):
-                    h = fnv_step(fnv_step(h_nn, d2[vv]), play_bs)
-                    jp_wid = jp_map.get(h, 0)
-                    en_wid = en_map.get(h, 0)
-                    if not jp_wid and not en_wid:
-                        continue
-                    ev = f"voice_{sp_s}{kk:02d}{nn:02d}{vv:02d}_Play"
-                    if kk in GRUNT_KK:
-                        tier = "skip_grunt"
-                    elif kk in BANTER_KK:
-                        tier = "banter" if ev in banter_events else "banter_orphan"
-                    else:
-                        tier = "high"
-                    jp_dur = get_wem_duration(jp_pck, jp_wems, jp_wid) if jp_wid else 0.0
-                    en_dur = get_wem_duration(en_pck, en_wems, en_wid) if en_wid else 0.0
-                    entries.append({
-                        "event": ev,
-                        "pack": pack_tag,
-                        "speaker_id": sp,
-                        "kk": kk,
-                        "tier": tier,
-                        "jp_wem": jp_wid,
-                        "en_wem": en_wid,
-                        "jp_dur": jp_dur,
-                        "en_dur": en_dur,
-                    })
+                    h_base = fnv_step(h_nn, d2[vv])
+                    ev_bare = f"voice_{sp_s}{kk:02d}{nn:02d}{vv:02d}_Play"
+                    for sf, sf_b in zip(VOICE_SUFFIXES, suf_bs):
+                        h = fnv_step(fnv_step(h_base, sf_b), play_bs) if sf else fnv_step(h_base, play_bs)
+                        jp_wid = jp_map.get(h, 0)
+                        en_wid = en_map.get(h, 0)
+                        if not jp_wid and not en_wid:
+                            continue
+                        ev = f"voice_{sp_s}{kk:02d}{nn:02d}{vv:02d}{sf}_Play"
+                        if kk in GRUNT_KK:
+                            tier = "skip_grunt"
+                        elif kk in BANTER_KK:
+                            # The banter table names the bare event; a suffixed take is still that turn.
+                            tier = "banter" if (ev_bare in banter_events or ev in banter_events) else "banter_orphan"
+                        else:
+                            tier = "high"
+                        jp_dur = get_wem_duration(jp_pck, jp_wems, jp_wid) if jp_wid else 0.0
+                        en_dur = get_wem_duration(en_pck, en_wems, en_wid) if en_wid else 0.0
+                        entries.append({
+                            "event": ev,
+                            "pack": pack_tag,
+                            "speaker_id": sp,
+                            "kk": kk,
+                            "tier": tier,
+                            "jp_wem": jp_wid,
+                            "en_wem": en_wid,
+                            "jp_dur": jp_dur,
+                            "en_dur": en_dur,
+                        })
     return entries
 
 

@@ -406,6 +406,11 @@ void VoiceDatabase::seed_mock_entries() {
     add_sp(505, "火花",     true, 0, 1, elem_color(1));
     add_sp(506, "艾尔玛",   true, 0, 8, elem_color(8));
 
+    // Switch 2 Edition additions (231..232). MOMO is not part of the 91-speaker base table and has no line in
+    // the shipped subtitle packs, so her cues come through the director's [待翻译] fallback.
+    add_sp(231, "MOMO",     true, 0, 7, elem_color(7));
+    add_sp(232, "MOMO (i)", true, 0, 7, elem_color(7));
+
     // Torna: The Golden Country (黄金国伊拉) 9 Playable Heroes (701..709)
     add_sp(701, "劳拉",   false, 704, 0, 0xF43F5EFFu);
     add_sp(702, "阿德尔", false, 706, 0, 0x3B82F6FFu);

@@ -2176,8 +2176,9 @@ bool Overlay::picker_open() const {
     return impl_ && impl_->picker_open.load(std::memory_order_relaxed);
 }
 
-uint64_t Overlay::create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3_linear, size_t bytes) {
-    if (!impl_ || !impl_->backend_ready || !impl_->ctx.device || !bc3_linear || w < 4 || h < 4) return 0;
+uint64_t Overlay::create_hud_texture_bc(uint32_t w, uint32_t h, const void* linear, size_t bytes,
+                                        uint32_t vk_format, const char* label) {
+    if (!impl_ || !impl_->backend_ready || !impl_->ctx.device || !linear || w < 4 || h < 4) return 0;
     const size_t expected = static_cast<size_t>((w + 3u) / 4u) * static_cast<size_t>((h + 3u) / 4u) * 16ull;
     if (bytes < expected) return 0;
 
@@ -2198,16 +2199,16 @@ uint64_t Overlay::create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3
     }
 
     gfx::ImageDesc id;
-    id.format = VK_FORMAT_BC3_UNORM_BLOCK;
+    id.format = static_cast<VkFormat>(vk_format);
     id.width = w;
     id.height = h;
     id.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    id.name = "hud_bc3_atlas";
+    id.name = "hud_bc_atlas";
     gfx::Image img;
     if (dev.create_image(id, &img) != VK_SUCCESS) return 0;
 
     gfx::Buffer staging;
-    if (dev.create_buffer(expected, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gfx::MemoryUse::Upload, &staging, "hud_bc3_stage") != VK_SUCCESS) {
+    if (dev.create_buffer(expected, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gfx::MemoryUse::Upload, &staging, "hud_bc_stage") != VK_SUCCESS) {
         dev.destroy_image(img);
         return 0;
     }
@@ -2216,7 +2217,7 @@ uint64_t Overlay::create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3
         dev.destroy_image(img);
         return 0;
     }
-    std::memcpy(staging.mapped, bc3_linear, expected);
+    std::memcpy(staging.mapped, linear, expected);
     dev.flush_buffer(staging);
 
     dev.submit_once([&](VkCommandBuffer cb) {
@@ -2255,8 +2256,16 @@ uint64_t Overlay::create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3
         return 0;
     }
     s.hud_textures.push_back({img, ds});
-    NXLOG_I(kTag, "uploaded HUD BC3 texture %ux%u (%zu KiB)", w, h, expected / 1024u);
+    NXLOG_I(kTag, "uploaded HUD %s texture %ux%u (%zu KiB)", label, w, h, expected / 1024u);
     return reinterpret_cast<uint64_t>(ds);
+}
+
+uint64_t Overlay::create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3_linear, size_t bytes) {
+    return create_hud_texture_bc(w, h, bc3_linear, bytes, static_cast<uint32_t>(VK_FORMAT_BC3_UNORM_BLOCK), "BC3");
+}
+
+uint64_t Overlay::create_hud_texture_bc7(uint32_t w, uint32_t h, const void* bc7_linear, size_t bytes) {
+    return create_hud_texture_bc(w, h, bc7_linear, bytes, static_cast<uint32_t>(VK_FORMAT_BC7_UNORM_BLOCK), "BC7");
 }
 
 }  // namespace nxrt::gfx
