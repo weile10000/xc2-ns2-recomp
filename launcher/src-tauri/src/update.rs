@@ -464,24 +464,57 @@ pub fn install(install: &Path, top: &Path, old: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Compares two files without loading whole multi-hundred-MB DLLs into memory: checks length first, then streams
+/// in chunks (returning `Err` if either file cannot be opened/read so callers fail closed instead of silently skipping).
+fn files_equal(a: &Path, b: &Path) -> std::io::Result<bool> {
+    if fs::metadata(a)?.len() != fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    let mut fa = fs::File::open(a)?;
+    let mut fb = fs::File::open(b)?;
+    let mut ba = vec![0u8; 256 * 1024];
+    let mut bb = vec![0u8; 256 * 1024];
+    loop {
+        let na = fa.read(&mut ba)?;
+        if na == 0 {
+            return Ok(fb.read(&mut bb[..1])? == 0);
+        }
+        let mut got = 0;
+        while got < na {
+            let nb = fb.read(&mut bb[got..na])?;
+            if nb == 0 {
+                return Ok(false);
+            }
+            got += nb;
+        }
+        if ba[..na] != bb[..na] {
+            return Ok(false);
+        }
+    }
+}
+
 /// Compares a directory under `install` against the backup saved aside under `update/old` (because `tar -m` gives all
-/// unpacked files the current timestamp). Returns `Some(reason)` when files were added, removed, or modified.
+/// unpacked files the current timestamp). Returns `Some(reason)` when files were added, removed, modified, or unreadable.
 fn dir_changed(install: &Path, old_dir: &Path, rel_dir: &str, missing_or_list_reason: &str) -> Option<String> {
     let new_d = install.join(rel_dir);
     let old_d = old_dir.join(rel_dir);
     if !new_d.is_dir() && !old_d.is_dir() {
         return None;
     }
-    let mut new_files = walk(&new_d);
-    let mut old_files = walk(&old_d);
+    let keep = |p: &PathBuf| !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdb"));
+    let mut new_files: Vec<PathBuf> = walk(&new_d).into_iter().filter(keep).collect();
+    let mut old_files: Vec<PathBuf> = walk(&old_d).into_iter().filter(keep).collect();
     new_files.sort();
     old_files.sort();
     if new_files != old_files {
         return Some(missing_or_list_reason.into());
     }
     for rel in &new_files {
-        if fs::read(new_d.join(rel)).ok() != fs::read(old_d.join(rel)).ok() {
-            return Some(format!("{}/{} changed", rel_dir, crate::dump::fwd(rel)));
+        match files_equal(&new_d.join(rel), &old_d.join(rel)) {
+            Ok(true) => {}
+            Ok(false) => return Some(format!("{}/{} changed", rel_dir, crate::dump::fwd(rel))),
+            // Fail closed on read/lock errors (e.g. AV scanner holding a file) rather than treating as unchanged.
+            Err(_) => return Some(format!("{}/{} could not be verified", rel_dir, crate::dump::fwd(rel))),
         }
     }
     None
@@ -680,7 +713,20 @@ mod tests {
         assert!(why.contains("runtime/xc2_rt.dll"), "unexpected reason: {why}");
         put(inst.join("runtime/xc2_rt.dll"), "dll-v1");
 
-        // Shader translator change must trigger Set up so cached shaders are refreshed.
+        // Shader translator change (including Spv.Generator.dll / AmpereDecoder.dll) must trigger Set up;
+        // debug-symbol .pdb changes must not.
+        put(inst.join("tools/spirv_harness/spirv_harness.pdb"), "pdb-v2");
+        put(old.join("tools/spirv_harness/spirv_harness.pdb"), "pdb-v1");
+        assert_eq!(rebuild_needed(&inst, &inst), (Some(false), String::new()));
+
+        put(inst.join("tools/spirv_harness/Spv.Generator.dll"), "spv-v2");
+        put(old.join("tools/spirv_harness/Spv.Generator.dll"), "spv-v1");
+        let (need, why) = rebuild_needed(&inst, &inst);
+        assert_eq!(need, Some(true));
+        assert!(why.contains("tools/spirv_harness/Spv.Generator.dll"), "unexpected reason: {why}");
+        put(inst.join("tools/spirv_harness/Spv.Generator.dll"), "spv-v1");
+
+        // Same-length byte change must be caught by streaming comparison too.
         put(inst.join("tools/spirv_harness/Ryujinx.Graphics.Shader.dll"), "tr-v2");
         let (need, why) = rebuild_needed(&inst, &inst);
         assert_eq!(need, Some(true));

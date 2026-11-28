@@ -129,6 +129,10 @@ class InstallManifestTests(unittest.TestCase):
         (self.repo / "tools" / "python" / "Lib" / "site-packages" / "nxrecomp" / "program.py").write_text("# v1\n", encoding="utf-8")
         (self.repo / "tools" / "spirv_harness" / "spirv_harness.exe").write_bytes(b"apphost")
         (self.repo / "tools" / "spirv_harness" / "Ryujinx.Graphics.Shader.dll").write_bytes(b"translator-v1")
+        (self.repo / "tools" / "spirv_harness" / "Spv.Generator.dll").write_bytes(b"spvgen-v1")
+        (self.repo / "tools" / "spirv_harness" / "AmpereDecoder.dll").write_bytes(b"ampere-v1")
+        (self.repo / "tools" / "spirv_harness" / "Gommon.dll").write_bytes(b"gommon-v1")
+        (self.repo / "tools" / "spirv_harness" / "spirv_harness.pdb").write_bytes(b"pdb-v1")
         (self.repo / "tools" / "shader-cache" / "build_cache.py").write_text("# cache v1\n", encoding="utf-8")
         (self.install / "romfs" / "bf2.ard").write_bytes(b"ard-data-v1")
         for m in self.setup.MODULES:
@@ -275,8 +279,16 @@ class InstallManifestTests(unittest.TestCase):
             self.assertTrue(self.setup.step_shaders_package(r1, self.repo, self.install, pathlib.Path("python"), jobs=2))
             self.assertTrue(pack.is_file(), "unchanged translator must keep preload pack")
 
-            # Update Ryujinx.Graphics.Shader.dll -> must invoke build_cache.py --refresh and explicitly drop pack.
-            (self.repo / "tools" / "spirv_harness" / "Ryujinx.Graphics.Shader.dll").write_bytes(b"translator-v2")
+            # Debug-symbol .pdb changes must NOT trigger a full 12,132-shader re-translation!
+            (self.repo / "tools" / "spirv_harness" / "spirv_harness.pdb").write_bytes(b"pdb-v2-different")
+            (self.repo / "tools" / "spirv_harness" / "Ryujinx.Graphics.Shader.pdb").write_bytes(b"pdb-extra")
+            r_pdb = FakeRunner()
+            self.assertTrue(self.setup.step_shaders_package(r_pdb, self.repo, self.install, pathlib.Path("python"), jobs=2))
+            self.assertEqual(r_pdb.cmds, [], ".pdb changes must not trigger shader re-translation")
+            self.assertTrue(pack.is_file(), ".pdb changes must keep preload pack")
+
+            # Updating Spv.Generator.dll (non-Ryujinx/non-spirv_harness prefix DLL) MUST trigger --refresh and drop pack!
+            (self.repo / "tools" / "spirv_harness" / "Spv.Generator.dll").write_bytes(b"spvgen-v2")
             r2 = FakeRunner()
             self.assertTrue(self.setup.step_shaders_package(r2, self.repo, self.install, pathlib.Path("python"), jobs=2))
             self.assertEqual(len(r2.cmds), 1)

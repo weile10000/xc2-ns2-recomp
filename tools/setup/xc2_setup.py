@@ -881,9 +881,15 @@ def shader_inputs_hash(repo, install):
     pairs = []
     hdir = repo / "tools" / "spirv_harness"
     if hdir.is_dir():
-        # Self-contained .NET publishes put the translator logic in spirv_harness.dll / Ryujinx*.dll beside the apphost exe.
+        # Include all top-level translator binaries/config (Spv.Generator.dll, AmpereDecoder.dll, Gommon.dll,
+        # Ryujinx*.dll, spirv_harness.dll/.exe/.json) while ignoring debug-symbol .pdb files.
         for f in sorted(hdir.iterdir()):
-            if f.is_file() and (f.name.startswith("spirv_harness") or f.name.startswith("Ryujinx")):
+            if not f.is_file():
+                continue
+            n = f.name.lower()
+            if n.endswith(".pdb"):
+                continue
+            if n.endswith((".dll", ".exe", ".json")):
                 pairs.append(("harness/" + f.name, f))
     for sdir in (repo / "tools" / "shader-cache", repo / "tools" / "shader" / "cache"):
         if sdir.is_dir():
@@ -1567,7 +1573,7 @@ def step_shaders_package(r, repo, install, py, jobs):
             return r.end_step("shaders", started, False, "no bf2.ard under " + str(install / "romfs"))
         n = jobs if jobs > 0 else max(2, (os.cpu_count() or 4) - 1)
         if need_refresh:
-            r.log("  shader translator or archive changed; refreshing cached shaders in-place (append-only)")
+            r.log("  shader translator or archive changed; re-translating archive shaders in-place (append-only; takes about as long as first-time setup)")
         else:
             r.log("  reading the archive and translating what the cache lacks; this is the long step")
         # The progress filter drops everything that is not a stage line, which also dropped the child's traceback:
