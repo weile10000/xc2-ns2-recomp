@@ -464,8 +464,64 @@ pub fn install(install: &Path, top: &Path, old: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the updated package requires rebuilding xc2_boot.exe. Compares `install/xc2` against `update/old/xc2`
-/// saved aside during `install()` (because `tar -m` gives all unpacked files the current timestamp).
+/// Compares two files without loading whole multi-hundred-MB DLLs into memory: checks length first, then streams
+/// in chunks (returning `Err` if either file cannot be opened/read so callers fail closed instead of silently skipping).
+fn files_equal(a: &Path, b: &Path) -> std::io::Result<bool> {
+    if fs::metadata(a)?.len() != fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    let mut fa = fs::File::open(a)?;
+    let mut fb = fs::File::open(b)?;
+    let mut ba = vec![0u8; 256 * 1024];
+    let mut bb = vec![0u8; 256 * 1024];
+    loop {
+        let na = fa.read(&mut ba)?;
+        if na == 0 {
+            return Ok(fb.read(&mut bb[..1])? == 0);
+        }
+        let mut got = 0;
+        while got < na {
+            let nb = fb.read(&mut bb[got..na])?;
+            if nb == 0 {
+                return Ok(false);
+            }
+            got += nb;
+        }
+        if ba[..na] != bb[..na] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Compares a directory under `install` against the backup saved aside under `update/old` (because `tar -m` gives all
+/// unpacked files the current timestamp). Returns `Some(reason)` when files were added, removed, modified, or unreadable.
+fn dir_changed(install: &Path, old_dir: &Path, rel_dir: &str, missing_or_list_reason: &str) -> Option<String> {
+    let new_d = install.join(rel_dir);
+    let old_d = old_dir.join(rel_dir);
+    if !new_d.is_dir() && !old_d.is_dir() {
+        return None;
+    }
+    let keep = |p: &PathBuf| !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdb"));
+    let mut new_files: Vec<PathBuf> = walk(&new_d).into_iter().filter(keep).collect();
+    let mut old_files: Vec<PathBuf> = walk(&old_d).into_iter().filter(keep).collect();
+    new_files.sort();
+    old_files.sort();
+    if new_files != old_files {
+        return Some(missing_or_list_reason.into());
+    }
+    for rel in &new_files {
+        match files_equal(&new_d.join(rel), &old_d.join(rel)) {
+            Ok(true) => {}
+            Ok(false) => return Some(format!("{}/{} changed", rel_dir, crate::dump::fwd(rel))),
+            // Fail closed on read/lock errors (e.g. AV scanner holding a file) rather than treating as unchanged.
+            Err(_) => return Some(format!("{}/{} could not be verified", rel_dir, crate::dump::fwd(rel))),
+        }
+    }
+    None
+}
+
+/// Whether the updated package requires running Set up again. Compares `xc2/`, `runtime/`, and the shader toolchain
+/// (`tools/spirv_harness/`, `tools/shader-cache/`, `tools/shader/`) against `update/old/` saved aside during `install()`.
 pub fn rebuild_needed(install: &Path, game_dir: &Path) -> (Option<bool>, String) {
     if !game_dir.join("xc2_boot.exe").is_file() {
         return (Some(true), "xc2_boot.exe is not built yet".into());
@@ -474,21 +530,15 @@ pub fn rebuild_needed(install: &Path, game_dir: &Path) -> (Option<bool>, String)
     if !old_dir.is_dir() {
         return (None, String::new());
     }
-    let new_xc2 = install.join("xc2");
-    let old_xc2 = old_dir.join("xc2");
-    if !new_xc2.is_dir() && !old_xc2.is_dir() {
-        return (Some(false), String::new());
-    }
-    let mut new_files = walk(&new_xc2);
-    let mut old_files = walk(&old_xc2);
-    new_files.sort();
-    old_files.sort();
-    if new_files != old_files {
-        return (Some(true), "hook tables or stub sources changed".into());
-    }
-    for rel in &new_files {
-        if fs::read(new_xc2.join(rel)).ok() != fs::read(old_xc2.join(rel)).ok() {
-            return (Some(true), format!("{} changed", crate::dump::fwd(rel)));
+    for (rel_dir, list_reason) in [
+        ("xc2", "hook tables or stub sources changed"),
+        ("runtime", "runtime libraries changed"),
+        ("tools/spirv_harness", "shader translator changed"),
+        ("tools/shader-cache", "shader cache scripts changed"),
+        ("tools/shader", "shader patch scripts changed"),
+    ] {
+        if let Some(reason) = dir_changed(install, &old_dir, rel_dir, list_reason) {
+            return (Some(true), reason);
         }
     }
     (Some(false), String::new())
@@ -643,16 +693,51 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_needed_tracks_boot_exe_and_xc2_sources() {
+    fn rebuild_needed_tracks_boot_exe_xc2_runtime_and_shader_harness() {
         let inst = tmp("rb1");
         let old = inst.join(WORK).join("old");
         put(inst.join("xc2/sites/main.txt"), "same");
         put(old.join("xc2/sites/main.txt"), "same");
+        put(inst.join("runtime/xc2_rt.dll"), "dll-v1");
+        put(old.join("runtime/xc2_rt.dll"), "dll-v1");
+        put(inst.join("tools/spirv_harness/Ryujinx.Graphics.Shader.dll"), "tr-v1");
+        put(old.join("tools/spirv_harness/Ryujinx.Graphics.Shader.dll"), "tr-v1");
         assert_eq!(rebuild_needed(&inst, &inst).0, Some(true));
         put(inst.join("xc2_boot.exe"), "exe");
         assert_eq!(rebuild_needed(&inst, &inst), (Some(false), String::new()));
+
+        // Runtime DLL change must trigger Set up so the new DLL is synced / manifest-checked.
+        put(inst.join("runtime/xc2_rt.dll"), "dll-v2");
+        let (need, why) = rebuild_needed(&inst, &inst);
+        assert_eq!(need, Some(true));
+        assert!(why.contains("runtime/xc2_rt.dll"), "unexpected reason: {why}");
+        put(inst.join("runtime/xc2_rt.dll"), "dll-v1");
+
+        // Shader translator change (including Spv.Generator.dll / AmpereDecoder.dll) must trigger Set up;
+        // debug-symbol .pdb changes must not.
+        put(inst.join("tools/spirv_harness/spirv_harness.pdb"), "pdb-v2");
+        put(old.join("tools/spirv_harness/spirv_harness.pdb"), "pdb-v1");
+        assert_eq!(rebuild_needed(&inst, &inst), (Some(false), String::new()));
+
+        put(inst.join("tools/spirv_harness/Spv.Generator.dll"), "spv-v2");
+        put(old.join("tools/spirv_harness/Spv.Generator.dll"), "spv-v1");
+        let (need, why) = rebuild_needed(&inst, &inst);
+        assert_eq!(need, Some(true));
+        assert!(why.contains("tools/spirv_harness/Spv.Generator.dll"), "unexpected reason: {why}");
+        put(inst.join("tools/spirv_harness/Spv.Generator.dll"), "spv-v1");
+
+        // Same-length byte change must be caught by streaming comparison too.
+        put(inst.join("tools/spirv_harness/Ryujinx.Graphics.Shader.dll"), "tr-v2");
+        let (need, why) = rebuild_needed(&inst, &inst);
+        assert_eq!(need, Some(true));
+        assert!(why.contains("tools/spirv_harness/"), "unexpected reason: {why}");
+        put(inst.join("tools/spirv_harness/Ryujinx.Graphics.Shader.dll"), "tr-v1");
+
+        // Hook table change still triggers Set up.
         put(inst.join("xc2/sites/main.txt"), "changed");
-        assert_eq!(rebuild_needed(&inst, &inst).0, Some(true));
+        let (need, why) = rebuild_needed(&inst, &inst);
+        assert_eq!(need, Some(true));
+        assert!(why.contains("xc2/sites/main.txt"), "unexpected reason: {why}");
     }
 
     /// End to end against GitHub: FEFW_UPDATE_TEST_DIR = an unpacked older package.

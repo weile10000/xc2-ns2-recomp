@@ -130,6 +130,8 @@ def main(argv):
     ap.add_argument("--spirv-val", default="", help="spirv-val executable the harness validates with; unset: next to the "
                                                    "harness in tools/spirv-val, else the harness's own lookup (VULKAN_SDK, PATH)")
     ap.add_argument("--no-val", action="store_true", help="skip spirv-val per-shader subprocess validation")
+    ap.add_argument("--refresh", action="store_true",
+                    help="re-translate archive blocks and refresh their .spv/results.tsv entries in-place without deleting other cached shaders (append-only)")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--stage", default="", help="scratch folder (default: <blocks>/../build_cache)")
     ap.add_argument("--pack-tool", default="", help="optional pack_full.py; without it the pack is left alone")
@@ -182,8 +184,8 @@ def main(argv):
         rep.fail(EXIT_INPUT, "the manifest has no rows")
         return EXIT_INPUT
     have = cached(a.cache)
-    missing = [r for r in rows if r["hash"] not in have]
-    rep.step("plan", blocks=len(rows), cached=len(have), missing=len(missing))
+    missing = list(rows) if a.refresh else [r for r in rows if r["hash"] not in have]
+    rep.step("plan", blocks=len(rows), cached=len(have), missing=len(missing), refresh=a.refresh)
     if not missing:
         rep.done(translated=0, installed=0, note="the cache already covers every block")
         return EXIT_OK
@@ -278,35 +280,81 @@ def main(argv):
         if "resources" not in head.split("\t"):
             rep.fail(EXIT_INPUT, "the harness output has no 'resources' column: " + head)
             return EXIT_INPUT
-        if os.path.exists(results):
-            with open(results, encoding="utf-8") as f:
-                old_head = f.readline().rstrip("\n")
-                if old_head != head:
-                    rep.say("note: the cache was written under a different header")
-                    rep.say("      cache : " + old_head)
-                    rep.say("      harness: " + head)
+        if a.refresh and os.path.exists(results):
+            # Append-only refresh: update rows for newly produced shaders in place while preserving every other
+            # cached row (such as the 5 runtime-generated prefill shaders that never appear in bf2.ard).
+            updated = {}
+            with open(new_rows, encoding="utf-8") as f:
+                f.readline()
                 for line in f:
-                    if line.strip():
-                        known.add(line.split("\t", 1)[0])
-        add = []
-        with open(new_rows, encoding="utf-8") as f:
-            f.readline()
-            for line in f:
-                line = line.rstrip("\n")
-                if line and line.split("\t", 1)[0] not in known and line.split("\t", 1)[0] in produced:
-                    add.append(line)
-        if add:
-            if os.path.exists(results):
+                    line = line.rstrip("\n")
+                    if line:
+                        h = line.split("\t", 1)[0]
+                        if h in produced:
+                            updated[h] = line
+            if updated:
                 bak = results + ".bak-before-build"
                 if not os.path.exists(bak):
                     shutil.copy2(results, bak)
-            else:
-                with open(results, "w", encoding="utf-8", newline="\n") as f:
+                merged = []
+                seen = set()
+                with open(results, encoding="utf-8") as f:
+                    old_head = f.readline().rstrip("\n")
+                    if old_head != head:
+                        rep.say("note: the cache was written under a different header")
+                        rep.say("      cache : " + old_head)
+                        rep.say("      harness: " + head)
+                    for line in f:
+                        raw = line.rstrip("\n")
+                        if not raw.strip():
+                            continue
+                        h = raw.split("\t", 1)[0]
+                        if h in updated:
+                            merged.append(updated[h])
+                            seen.add(h)
+                        else:
+                            merged.append(raw)
+                            seen.add(h)
+                for h, line in updated.items():
+                    if h not in seen:
+                        merged.append(line)
+                tmp_results = results + ".tmp"
+                with open(tmp_results, "w", encoding="utf-8", newline="\n") as f:
                     f.write(head + "\n")
-            with open(results, "a", encoding="utf-8", newline="\n") as f:
-                for line in add:
-                    f.write(line + "\n")
-            added = len(add)
+                    for line in merged:
+                        f.write(line + "\n")
+                os.replace(tmp_results, results)
+                added = len(updated)
+        else:
+            if os.path.exists(results):
+                with open(results, encoding="utf-8") as f:
+                    old_head = f.readline().rstrip("\n")
+                    if old_head != head:
+                        rep.say("note: the cache was written under a different header")
+                        rep.say("      cache : " + old_head)
+                        rep.say("      harness: " + head)
+                    for line in f:
+                        if line.strip():
+                            known.add(line.split("\t", 1)[0])
+            add = []
+            with open(new_rows, encoding="utf-8") as f:
+                f.readline()
+                for line in f:
+                    line = line.rstrip("\n")
+                    if line and line.split("\t", 1)[0] not in known and line.split("\t", 1)[0] in produced:
+                        add.append(line)
+            if add:
+                if os.path.exists(results):
+                    bak = results + ".bak-before-build"
+                    if not os.path.exists(bak):
+                        shutil.copy2(results, bak)
+                else:
+                    with open(results, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(head + "\n")
+                with open(results, "a", encoding="utf-8", newline="\n") as f:
+                    for line in add:
+                        f.write(line + "\n")
+                added = len(add)
 
     packed = "left alone"
     pack_tool = a.pack_tool or os.path.join(here, "pack.py")
@@ -323,6 +371,22 @@ def main(argv):
             rep.fail(EXIT_STEP, "the pack tool failed with exit %d" % r.returncode)
             return EXIT_STEP
         packed = a.pack
+    elif a.refresh and copied > 0:
+        # spirv.preload.pack is read before loose .spv files and hashes results.tsv rows rather than .spv bytes;
+        # explicitly drop any stale pack after refreshing shaders so the runtime rebuilds it from the fresh .spv files.
+        dropped = []
+        cache_abs = os.path.abspath(a.cache)
+        for cand in (os.path.join(os.path.dirname(cache_abs), "spirv.preload.pack"),
+                     os.path.join(cache_abs, "spirv.preload.pack")):
+            if os.path.isfile(cand):
+                try:
+                    os.unlink(cand)
+                    dropped.append(cand)
+                except OSError:
+                    pass
+        if dropped:
+            packed = "dropped stale pack"
+            rep.say("dropped stale preload pack: " + ", ".join(dropped))
 
     after = cached(a.cache)
     # A block the harness could not translate is not a failure of this script: on the retail archive 22 of the

@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -581,13 +582,403 @@ def step_doctor_package(r, repo, tools):
     return r.end_step("doctor", started, True, "the package carries everything")
 
 
+# ---- install manifest (content-hashed upgrade state) ----------------------------------------------------------
+# One manifest at <install>/build/install-manifest.json tracks content hashes for lift, link, shaders, and
+# prefill so upgrades only re-run the stages whose inputs actually changed (never trusting file mtimes alone).
+# Existing installs without a manifest are seeded in-place on first upgrade without re-lifting or re-translating.
+MANIFEST_VERSION = 1
+PREFILL_SCHEMA_VERSION = 1
+
+
+def manifest_path(install):
+    return Path(install) / "build" / "install-manifest.json"
+
+
+def load_install_manifest(install):
+    p = manifest_path(install)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("version") == MANIFEST_VERSION:
+            return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_install_manifest(install, data, dry=False):
+    if dry:
+        return
+    p = manifest_path(install)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    out = dict(data)
+    out["version"] = MANIFEST_VERSION
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _sha256_bytes(blob):
+    return hashlib.sha256(blob).hexdigest()
+
+
+def file_fingerprint_fast(path):
+    """Content fingerprint that stays O(1) on multi-GB archives (size + first/last 64 KiB SHA-256)."""
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return ""
+    sz = st.st_size
+    if sz <= 262144:
+        return "%d:%s" % (sz, sha256_of(p))
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        h.update(f.read(65536))
+        f.seek(max(0, sz - 65536))
+        h.update(f.read(65536))
+    return "%d:%s" % (sz, h.hexdigest())
+
+
+def _hash_named_files(pairs):
+    h = hashlib.sha256()
+    for label, path in sorted(pairs, key=lambda kv: kv[0]):
+        p = Path(path)
+        if p.is_file():
+            h.update(label.encode("utf-8"))
+            h.update(b"\0")
+            h.update(sha256_of(p).encode("ascii"))
+            h.update(b"\n")
+    return h.hexdigest()
+
+
+def _pe_sections(data):
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return None
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe + 24 > len(data) or data[pe : pe + 4] != b"PE\0\0":
+        return None
+    nsec = struct.unpack_from("<H", data, pe + 6)[0]
+    opt_sz = struct.unpack_from("<H", data, pe + 20)[0]
+    opt_off = pe + 24
+    if opt_off + opt_sz > len(data) or opt_sz < 120:
+        return None
+    magic = struct.unpack_from("<H", data, opt_off)[0]
+    if magic not in (0x10B, 0x20B):
+        return None
+    dd_off = opt_off + (112 if magic == 0x20B else 96)
+    sec_off = opt_off + opt_sz
+    if sec_off + nsec * 40 > len(data):
+        return None
+    secs = []
+    for i in range(nsec):
+        o = sec_off + i * 40
+        vsize, va, rsize, roff = struct.unpack_from("<IIII", data, o + 8)
+        secs.append((va, max(vsize, rsize), roff))
+    return magic, dd_off, secs
+
+
+def _rva_to_off(secs, rva):
+    for va, sz, roff in secs:
+        if va <= rva < va + sz:
+            return roff + (rva - va)
+    return None
+
+
+def pe_export_names(path):
+    """Sorted exported symbol names of a PE DLL (e.g. xc2_rt.dll), or None if not a readable PE."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    parsed = _pe_sections(data)
+    if parsed is None:
+        return None
+    _, dd_off, secs = parsed
+    if dd_off + 8 > len(data):
+        return None
+    exp_rva, _ = struct.unpack_from("<II", data, dd_off)
+    if not exp_rva:
+        return []
+    eo = _rva_to_off(secs, exp_rva)
+    if eo is None or eo + 40 > len(data):
+        return None
+    num_names = struct.unpack_from("<I", data, eo + 24)[0]
+    names_rva = struct.unpack_from("<I", data, eo + 32)[0]
+    no = _rva_to_off(secs, names_rva)
+    if no is None or no + num_names * 4 > len(data):
+        return None
+    names = []
+    for i in range(num_names):
+        nrva = struct.unpack_from("<I", data, no + i * 4)[0]
+        p = _rva_to_off(secs, nrva)
+        if p is None or p >= len(data):
+            return None
+        end = data.find(b"\0", p)
+        if end < 0:
+            return None
+        names.append(data[p:end].decode("ascii", "replace"))
+    return sorted(names)
+
+
+def pe_imported_symbols(path, dll_name="xc2_rt.dll"):
+    """Sorted symbol names imported from `dll_name` by a PE exe, or None if not a readable PE."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    parsed = _pe_sections(data)
+    if parsed is None:
+        return None
+    magic, dd_off, secs = parsed
+    if dd_off + 16 > len(data):
+        return None
+    imp_rva, _ = struct.unpack_from("<II", data, dd_off + 8)
+    if not imp_rva:
+        return []
+    io = _rva_to_off(secs, imp_rva)
+    if io is None:
+        return None
+    want = dll_name.lower()
+    is_pe64 = magic == 0x20B
+    entry_sz = 8 if is_pe64 else 4
+    ord_mask = (1 << 63) if is_pe64 else (1 << 31)
+    syms = []
+    pos = io
+    while pos + 20 <= len(data):
+        ilt_rva, _, _, name_rva, iat_rva = struct.unpack_from("<IIIII", data, pos)
+        if ilt_rva == 0 and name_rva == 0 and iat_rva == 0:
+            break
+        pos += 20
+        np = _rva_to_off(secs, name_rva)
+        if np is None:
+            continue
+        end = data.find(b"\0", np)
+        if end < 0:
+            continue
+        mod = data[np:end].decode("ascii", "replace").lower()
+        if mod != want:
+            continue
+        tbl_rva = ilt_rva or iat_rva
+        tp = _rva_to_off(secs, tbl_rva)
+        if tp is None:
+            return None
+        while tp + entry_sz <= len(data):
+            val = struct.unpack_from("<Q" if is_pe64 else "<I", data, tp)[0]
+            if val == 0:
+                break
+            tp += entry_sz
+            if val & ord_mask:
+                return None  # ordinal import cannot be checked by symbol name
+            hp = _rva_to_off(secs, val & 0x7FFFFFFF)
+            if hp is None or hp + 2 >= len(data):
+                return None
+            send = data.find(b"\0", hp + 2)
+            if send < 0:
+                return None
+            syms.append(data[hp + 2 : send].decode("ascii", "replace"))
+    return sorted(set(syms))
+
+
+def parse_def_exports(path):
+    """Sorted export names from a .def file (xc2/release/src/xc2_rt.def), or None if absent."""
+    p = Path(path)
+    if not p.is_file():
+        return None
+    in_exports = False
+    names = []
+    for raw in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.split(";", 1)[0].strip()
+        if not line:
+            continue
+        if line.upper() == "EXPORTS":
+            in_exports = True
+            continue
+        if in_exports:
+            tok = line.split()[0]
+            if tok:
+                names.append(tok)
+    return sorted(names) if names else None
+
+
+def runtime_abi_signature(repo, install, rtlib=None):
+    """ABI fingerprint of xc2_rt.dll based on its exported C symbol table (xc2_rt.def).
+
+    Routine renderer/audio/UI updates keep the same 17 C exports, so xc2_boot.exe does not need to be
+    relinked by Zig when only xc2_rt.dll internals change. Falls back to xc2_rt.def or rtlib SHA-256.
+    """
+    dll_cands = []
+    if rtlib is not None:
+        dll_cands.append(Path(rtlib).parent / "xc2_rt.dll")
+    dll_cands += [
+        Path(repo) / "runtime" / "xc2_rt.dll",
+        Path(install) / "runtime" / "xc2_rt.dll",
+        Path(install) / "xc2_rt.dll",
+    ]
+    for dll in dll_cands:
+        if dll.is_file():
+            exports = pe_export_names(dll)
+            if exports:
+                return {"source": "pe_exports", "count": len(exports), "sha256": _sha256_bytes("\n".join(exports).encode("ascii"))}
+    for defp in (Path(repo) / "runtime" / "xc2_rt.def", Path(repo) / "xc2" / "release" / "src" / "xc2_rt.def"):
+        exports = parse_def_exports(defp)
+        if exports:
+            return {"source": "def", "count": len(exports), "sha256": _sha256_bytes("\n".join(exports).encode("ascii"))}
+    for fallback in ([Path(rtlib)] if rtlib is not None else []) + dll_cands:
+        if fallback.is_file():
+            return {"source": "file_sha256", "sha256": sha256_of(fallback)}
+    return None
+
+
+def exe_abi_compatible(exe, repo, install, rtlib=None):
+    """True when an existing PE xc2_boot.exe imports xc2_rt.dll symbols that are all exported by the current DLL."""
+    imports = pe_imported_symbols(exe, "xc2_rt.dll")
+    if not imports:
+        return False
+    dll_cands = []
+    if rtlib is not None:
+        dll_cands.append(Path(rtlib).parent / "xc2_rt.dll")
+    dll_cands += [Path(repo) / "runtime" / "xc2_rt.dll", Path(install) / "runtime" / "xc2_rt.dll"]
+    for dll in dll_cands:
+        if dll.is_file():
+            exports = pe_export_names(dll)
+            if exports:
+                return set(imports).issubset(set(exports))
+    return False
+
+
+def lift_inputs_hash(repo, exefs_dir):
+    """Per-module + lifter tool content hashes for step_lift_package."""
+    repo = Path(repo)
+    exefs_dir = Path(exefs_dir)
+    nx_roots = [
+        repo / "tools" / "python" / "Lib" / "site-packages" / "nxrecomp",
+        repo / "third_party" / "nxrecomp" / "recomp" / "nxrecomp",
+    ]
+    nx_pairs = []
+    for root in nx_roots:
+        if root.is_dir():
+            for f in root.rglob("*.py"):
+                nx_pairs.append(("nxrecomp/" + f.relative_to(root).as_posix(), f))
+            break
+    h_tool = hashlib.sha256()
+    h_tool.update(("bucket=0x%x\n" % PACKAGE_BUCKET).encode("ascii"))
+    h_tool.update(_hash_named_files(nx_pairs).encode("ascii"))
+    tool_hash = h_tool.hexdigest()
+
+    sites = repo / "xc2" / "sites"
+    mods = {}
+    for m in MODULES:
+        hm = hashlib.sha256()
+        hm.update(file_fingerprint_fast(exefs_dir / m).encode("ascii"))
+        hm.update(b"\n")
+        sf = sites / ("sites-%s.txt" % m)
+        if sf.is_file():
+            hm.update(sha256_of(sf).encode("ascii"))
+        mods[m] = hm.hexdigest()
+    return {"tool": tool_hash, "modules": mods}
+
+
+def link_inputs_hash(repo, install, rtlib, lift_state, cpu_var):
+    """Content hash governing whether xc2_boot.exe must be relinked."""
+    repo = Path(repo)
+    abi = runtime_abi_signature(repo, install, rtlib)
+    if abi is None:
+        return None
+    pairs = [
+        ("xc2/src/xc2_stub.cpp", repo / "xc2" / "src" / "xc2_stub.cpp"),
+        ("xc2/src/xc2_modules.h", repo / "xc2" / "src" / "xc2_modules.h"),
+    ]
+    payload = {
+        "abi": abi,
+        "cpu": cpu_var,
+        "stub": _hash_named_files(pairs),
+        "lift": lift_state,
+    }
+    return _sha256_bytes(json.dumps(payload, sort_keys=True).encode("utf-8"))
+
+
+def shader_inputs_hash(repo, install):
+    """Content hash covering bf2.ard, the shader translator (spirv_harness + Ryujinx DLLs), and cache scripts."""
+    repo = Path(repo)
+    install = Path(install)
+    pairs = []
+    hdir = repo / "tools" / "spirv_harness"
+    if hdir.is_dir():
+        # Include all top-level translator binaries/config (Spv.Generator.dll, AmpereDecoder.dll, Gommon.dll,
+        # Ryujinx*.dll, spirv_harness.dll/.exe/.json) while ignoring debug-symbol .pdb files.
+        for f in sorted(hdir.iterdir()):
+            if not f.is_file():
+                continue
+            n = f.name.lower()
+            if n.endswith(".pdb"):
+                continue
+            if n.endswith((".dll", ".exe", ".json")):
+                pairs.append(("harness/" + f.name, f))
+    for sdir in (repo / "tools" / "shader-cache", repo / "tools" / "shader" / "cache"):
+        if sdir.is_dir():
+            for f in sorted(sdir.glob("*.py")):
+                pairs.append(("shader-cache/" + f.name, f))
+            break
+    patch_ds = repo / "tools" / "shader" / "patch_ds_samplers.py"
+    if patch_ds.is_file():
+        pairs.append(("shader/patch_ds_samplers.py", patch_ds))
+    payload = {
+        "ard": file_fingerprint_fast(install / "romfs" / "bf2.ard"),
+        "tools": _hash_named_files(pairs),
+    }
+    return _sha256_bytes(json.dumps(payload, sort_keys=True).encode("utf-8"))
+
+
+def prefill_inputs_hash(shader_hash):
+    payload = {"schema": PREFILL_SCHEMA_VERSION, "shaders": shader_hash}
+    return _sha256_bytes(json.dumps(payload, sort_keys=True).encode("utf-8"))
+
+
+def drop_preload_pack(r, spirv):
+    """Explicitly remove stale spirv.preload.pack after shader refresh (the pack wins over loose .spv files)."""
+    spirv = Path(spirv)
+    removed = []
+    for cand in (spirv.parent / "spirv.preload.pack", spirv / "spirv.preload.pack"):
+        if cand.is_file():
+            if not r.dry:
+                try:
+                    cand.unlink()
+                except OSError:
+                    continue
+            removed.append(cand.name)
+    if removed:
+        r.log("  shaders: dropped stale %s so the runtime rebuilds it from refreshed .spv files" % ", ".join(removed))
+    return removed
+
+
 def step_lift_package(r, repo, install, py, jobs):
     started = r.step("lift")
     exefs_dir = prepare_patched_exefs(r, repo, install)
     # Build products live with the game, not in the package: a player's install folder is theirs to fill, and the
     # package stays exactly as it was unpacked.
     lift = install / "build" / "lift"
+    obj = install / "build" / "obj-zig"
     sites = repo / "xc2" / "sites"
+    manifest = load_install_manifest(install)
+    want_lift = lift_inputs_hash(repo, exefs_dir)
+    prev_lift = manifest.get("lift")
+    all_lifted = all((lift / m / ("module_%s.cpp" % m)).is_file() for m in MODULES)
+    if prev_lift is None and all_lifted:
+        # Legacy install seeding: do not force an existing install to re-lift on the first manifest-enabled upgrade.
+        r.log("  manifest: seeded lift from existing build/lift (legacy install)")
+        manifest["lift"] = want_lift
+        save_install_manifest(install, manifest, dry=r.dry)
+        return r.end_step("lift", started, True, "the lifted code is already there")
+    if isinstance(prev_lift, dict) and prev_lift != want_lift:
+        tool_changed = prev_lift.get("tool") != want_lift.get("tool")
+        prev_mods = prev_lift.get("modules") if isinstance(prev_lift.get("modules"), dict) else {}
+        stale_mods = [m for m in MODULES if tool_changed or prev_mods.get(m) != want_lift["modules"].get(m)]
+        if stale_mods:
+            r.log("  lift inputs changed for: %s" % ", ".join(stale_mods))
+            if not r.dry:
+                for m in stale_mods:
+                    shutil.rmtree(lift / m, ignore_errors=True)
+                    shutil.rmtree(obj / m, ignore_errors=True)
     n = jobs if jobs > 0 else max(2, (os.cpu_count() or 4) - 1)
     done = 0
     tasks = []
@@ -639,6 +1030,8 @@ def step_lift_package(r, repo, install, py, jobs):
                 pass
             if rc != 0:
                 return r.end_step("lift", started, False, "the lifter failed")
+    manifest["lift"] = want_lift
+    save_install_manifest(install, manifest, dry=r.dry)
     return r.end_step("lift", started, True)
 
 
@@ -705,14 +1098,33 @@ def step_link_package(r, repo, install, zig, rtlib, jobs):
     exe = install / "xc2_boot.exe"
     stamp = install / "build" / "link-stamp.json"
     sig = runtime_signature(rtlib)
-    # Same rule as the checkout: keep the exe only when it was linked against this exact runtime. The exe carries the
-    # lifted game code, so pairing a new xc2_rt.dll with an exe from an older release is a mixed build.
-    if exe.is_file() and link_stamp_matches(stamp, sig):
+    manifest = load_install_manifest(install)
+    cpu_var = cpu_variant(zig)
+    want_link = link_inputs_hash(repo, install, rtlib, manifest.get("lift"), cpu_var)
+    prev_link = manifest.get("link")
+    # Keep the exe when the manifest's ABI+stub+lift hash still matches (routine xc2_rt.dll-only updates keep the
+    # same 17 C exports and only need the new DLLs copied beside the exe). For legacy installs without a manifest,
+    # seed the manifest when the existing exe already matches link-stamp.json or passes PE import/export ABI checks.
+    exe_current = False
+    if exe.is_file() and want_link is not None:
+        if prev_link == want_link:
+            exe_current = True
+        elif prev_link is None and (link_stamp_matches(stamp, sig) or exe_abi_compatible(exe, repo, install, rtlib)):
+            r.log("  manifest: seeded link from existing xc2_boot.exe (legacy install, ABI compatible)")
+            manifest["link"] = want_link
+            save_install_manifest(install, manifest, dry=r.dry)
+            exe_current = True
+    elif exe.is_file() and link_stamp_matches(stamp, sig):
+        exe_current = True
+    if exe_current:
         # Clear high-entropy ASLR on existing installs across upgrades without forcing a full Zig relink.
         if not r.dry and clear_high_entropy_va(exe):
             r.log("  patched %s: cleared HIGH_ENTROPY_VA" % exe.name)
         # The exe is kept across an upgrade; the DLLs still have to land next to it (issue #2).
         copy_runtime_dlls(r, rtlib.parent, install)
+        if not r.dry and sig is not None:
+            stamp.parent.mkdir(parents=True, exist_ok=True)
+            stamp.write_text(json.dumps(sig), encoding="utf-8")
         return r.end_step("link", started, True, "the boot exe is already there")
     lift = install / "build" / "lift"
     obj = install / "build" / "obj-zig"
@@ -811,6 +1223,9 @@ def step_link_package(r, repo, install, zig, rtlib, jobs):
         r.log("  patched %s: cleared HIGH_ENTROPY_VA" % exe.name)
     copy_runtime_dlls(r, rtlib.parent, install)
     finalize_m3_state(r, install)
+    if want_link is not None:
+        manifest["link"] = want_link
+        save_install_manifest(install, manifest, dry=r.dry)
     if not r.dry and sig is not None:
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.write_text(json.dumps(sig), encoding="utf-8")
@@ -1122,6 +1537,10 @@ def step_shaders_package(r, repo, install, py, jobs):
     group layout (tools/shader-cache: ard_index, extract_embedded, translate, install). The cache lands in
     <install>/shader_cache/spirv, which is where [nvn] shader_cache points. A package ships no cache: it is derived
     from the player's own copy of the game.
+
+    The shader cache is append-only (12,137 complete programs = 12,132 from bf2.ard + 5 runtime-generated prefill
+    blocks). When the shader translator changes, existing archive shaders are refreshed in-place (--refresh) without
+    deleting the cache, and any stale spirv.preload.pack is explicitly dropped so the runtime rebuilds it.
     """
     started = r.step("shaders")
     spirv = install / "shader_cache" / "spirv"
@@ -1131,19 +1550,42 @@ def step_shaders_package(r, repo, install, py, jobs):
     # cache, 5 missing, black title) and every later setup skipped the step entirely.
     scanned = (spirv / "results.tsv").is_file() and any(spirv.glob("*.spv"))
     prefilled = install / "build" / "prefilled"
-    # The prefill names the blocks no file contains, and which blocks those are depends on the runtime - a new
-    # xc2_rt.dll can ask for a different set. The translated cache is keyed by shader hash and stays as it is, so
-    # only the headless pass is redone; the marker therefore carries the runtime signature it was made against.
     sig = install_runtime_signature(install)
     prefill_stamp = install / "build" / "prefill-stamp.json"
-    prefill_stale = prefilled.is_file() and not link_stamp_matches(prefill_stamp, sig)
+
+    manifest = load_install_manifest(install)
+    want_shaders = shader_inputs_hash(repo, install)
+    want_prefill = prefill_inputs_hash(want_shaders)
+    prev_shaders = manifest.get("shaders")
+    prev_prefill = manifest.get("prefill")
+
+    # Legacy seeding: an existing install without an install-manifest.json must not be forced to re-translate all
+    # 12,132 archive shaders on its first manifest-enabled upgrade.
+    if prev_shaders is None and scanned:
+        r.log("  manifest: seeded shaders from existing cache (legacy install)")
+        manifest["shaders"] = want_shaders
+        prev_shaders = want_shaders
+        if prefilled.is_file() and (not prefill_stamp.is_file() or link_stamp_matches(prefill_stamp, sig)):
+            manifest["prefill"] = want_prefill
+            prev_prefill = want_prefill
+        save_install_manifest(install, manifest, dry=r.dry)
+
+    need_refresh = scanned and (prev_shaders != want_shaders)
+    if prev_prefill is not None:
+        prefill_stale = prefilled.is_file() and (prev_prefill != want_prefill or need_refresh)
+    else:
+        # Legacy install whose prefill-stamp.json was already mismatched against the runtime (#83).
+        prefill_stale = prefilled.is_file() and prefill_stamp.is_file() and not link_stamp_matches(prefill_stamp, sig)
     if prefill_stale:
-        r.log("  the runtime changed since the shader prefill; running that pass again (the cache is kept)")
+        r.log("  shader prefill inputs changed; running the headless prefill pass again (the cache is kept)")
         if not r.dry:
             prefilled.unlink(missing_ok=True)
-    if scanned and prefilled.is_file() and not prefill_stale:
+    if scanned and not need_refresh and prefilled.is_file() and not prefill_stale:
+        if not r.dry and sig is not None and not link_stamp_matches(prefill_stamp, sig):
+            prefill_stamp.parent.mkdir(parents=True, exist_ok=True)
+            prefill_stamp.write_text(json.dumps(sig), encoding="utf-8")
         return r.end_step("shaders", started, True, "the shader cache is already there")
-    if not scanned:
+    if not scanned or need_refresh:
         tool = first_file(repo / "tools" / "shader" / "cache" / "build_cache.py", repo / "tools" / "shader-cache" / "build_cache.py")
         ard = install / "romfs" / "bf2.ard"
         if not tool.is_file():
@@ -1153,7 +1595,10 @@ def step_shaders_package(r, repo, install, py, jobs):
         if not ard.is_file():
             return r.end_step("shaders", started, False, "no bf2.ard under " + str(install / "romfs"))
         n = jobs if jobs > 0 else max(2, (os.cpu_count() or 4) - 1)
-        r.log("  reading the archive and translating what the cache lacks; this is the long step")
+        if need_refresh:
+            r.log("  shader translator or archive changed; re-translating archive shaders in-place (append-only; takes about as long as first-time setup)")
+        else:
+            r.log("  reading the archive and translating what the cache lacks; this is the long step")
         # The progress filter drops everything that is not a stage line, which also dropped the child's traceback:
         # a failing shader step used to say "the shader chain failed" and nothing else (issue #5, 2026-11-18). Keep the
         # tail and print it when the child exits non-zero.
@@ -1164,15 +1609,22 @@ def step_shaders_package(r, repo, install, py, jobs):
             tail.append(line)
             progress(line)
 
-        rc = r.run([str(py), str(tool), "--ard", str(ard), "--cache", str(spirv), "--harness", str(harness),
-                    "--work", str(install / "build" / "shader-cache"), "--jobs", str(n), "--no-val"],
-                   cwd=repo, on_line=keep)
+        cmd = [str(py), str(tool), "--ard", str(ard), "--cache", str(spirv), "--harness", str(harness),
+               "--work", str(install / "build" / "shader-cache"), "--jobs", str(n), "--no-val"]
+        if need_refresh:
+            cmd.append("--refresh")
+        rc = r.run(cmd, cwd=repo, on_line=keep)
         if rc != 0:
             r.log("  the shader chain exited with code %d; its last lines:" % rc)
             for ln in tail:
                 r.log("  | " + ln.rstrip()[:300])
             return r.end_step("shaders", started, False, "the shader chain failed (exit %d); see the lines above" % rc)
         r.log("  %d shader(s) from the archive" % len(list(spirv.glob("*.spv"))))
+        if need_refresh:
+            # spirv.preload.pack is read before loose .spv files; explicitly drop it after refreshing shaders.
+            drop_preload_pack(r, spirv)
+        manifest["shaders"] = want_shaders
+        save_install_manifest(install, manifest, dry=r.dry)
     else:
         # Re-walking the archive only retries the 22 blocks the translator rejects, and build_cache.py treats "not one
         # shader came out" as a hard failure - measured 2026-11-18. The scan half is done; only the prefill is missing.
@@ -1197,6 +1649,9 @@ def step_shaders_package(r, repo, install, py, jobs):
             note += ("; code patches from %s are compiled into this build - disable the mod and run Set up again "
                      "if the patch was written for another build" % ", ".join(mods))
         return r.end_step("shaders", started, False, note)
+    manifest["shaders"] = want_shaders
+    manifest["prefill"] = want_prefill
+    save_install_manifest(install, manifest, dry=r.dry)
     if not r.dry and sig is not None:
         prefill_stamp.parent.mkdir(parents=True, exist_ok=True)
         prefill_stamp.write_text(json.dumps(sig), encoding="utf-8")

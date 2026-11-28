@@ -52,6 +52,7 @@ class TestRawDumpAndDlc(unittest.TestCase):
                 "0100e95004039063": jp_voice,
             })
 
+    @unittest.skipUnless(sys.platform == "win32", "NTFS junction test requires Windows")
     def test_link_dlc_normalizes_nested_layout_and_replaces_legacy_junction(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
