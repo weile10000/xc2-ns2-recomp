@@ -14,6 +14,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1367,6 +1368,18 @@ static bool xc2_lock_render_size() {
     return on;
 }
 
+// True when the upscaler the runtime is actually running keeps no temporal history. Only a spatial upscaler
+// needs the game's Halton(2,3) sub-pixel jitter removed: with no accumulation every frame is a resample at a
+// different sub-pixel offset, which is the wobbling moire in #94. TAAU / FSR / DLSS consume the jitter and must
+// keep it. The answer comes from the runtime's live setting (F1 hot-switches it mid-session), not from the raw
+// ini string, so the three mismatches reported in #94 - "spatial" not recognised, a case-sensitive compare, and
+// a default that disagreed with the runtime's - cannot come back.
+static bool upscaler_is_spatial() {
+    std::string up = nxrt::nvn::dlss_live_info().upscaler;
+    for (char& ch : up) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return up == "bilinear" || up == "spatial" || up == "nearest" || up == "none";
+}
+
 // ---- native resolution override (3.0.1) -------------------------------------------------------------------------------------
 // [xc2] native_res = 0 (off) | 1 (native 100%, DLSS off) | 2 (DLSS/FSR 1:1 Native AA at [xc2] native_w x native_h)
 // [xc2] native_w / native_h: target 3D render size for native_res=2 (defaults to [am] resolution, fallback 2560x1440)
@@ -1485,6 +1498,59 @@ static void arm_native_res(uint64_t main_base) {
         NXLOG_I("xc2", "native_res: display res_class forced to %lld (effective %lld)",
                 static_cast<long long>(rcls), static_cast<long long>(effective_rcls));
     }
+    // Per-frame hook on getHaltonJitter (0x83f660, x0 = dlss_rt). Installed for every native_res mode: the jitter
+    // the game adds is the same whether or not we are driving the render size, and #94 measured it on the
+    // default native_res = 0 path, where nothing used to be hooked at all.
+    // 1) mode 2 only: when target == base (e.g. true native 4K), keep dlss_rt+28 = 0 (direct-to-swapchain
+    //    output) even if f_710084d250 re-sets mode 1/3 on a scene or display transition.
+    // 2) always: zero the Halton(2,3) sub-pixel projection jitter when the upscaler that is actually running is
+    //    spatial, and leave it alone for TAAU / FSR / DLSS, which need it.
+    nxrt::hook_add_entry(main_base + 0x83f660, [](::Ctx* c, uint64_t, void*) -> int {
+        if (g_nat_mode == 2) {
+            const uint64_t dlss_rt = c->x[0];
+            if (dlss_rt && nxrt::mem::is_mapped(dlss_rt, 88)) {
+                uint64_t ctx = 0;
+                std::memcpy(&ctx, reinterpret_cast<const void*>(dlss_rt), 8);
+                if (ctx && nxrt::mem::is_mapped(ctx + 0x5e0, 8)) {
+                    uint64_t view = 0;
+                    std::memcpy(&view, reinterpret_cast<const void*>(ctx + 0x5e0), 8);
+                    if (view && nxrt::mem::is_mapped(view + 40, 8)) {
+                        int32_t bw = 0, bh = 0;
+                        std::memcpy(&bw, reinterpret_cast<const void*>(view + 40), 4);
+                        std::memcpy(&bh, reinterpret_cast<const void*>(view + 44), 4);
+                        if (bw > 0 && bh > 0 && g_nat_w >= bw && g_nat_h >= bh) {
+                            uint32_t cur_mode = 0;
+                            std::memcpy(&cur_mode, reinterpret_cast<const void*>(dlss_rt + 28), 4);
+                            if (cur_mode != 0) {
+                                const uint32_t zero32 = 0;
+                                const uint8_t one8 = 1;
+                                const uint32_t ubw = static_cast<uint32_t>(bw);
+                                const uint32_t ubh = static_cast<uint32_t>(bh);
+                                std::memcpy(reinterpret_cast<void*>(dlss_rt + 28), &zero32, 4);
+                                std::memcpy(reinterpret_cast<void*>(dlss_rt + 48), &ubw, 4);
+                                std::memcpy(reinterpret_cast<void*>(dlss_rt + 52), &ubh, 4);
+                                std::memcpy(reinterpret_cast<void*>(dlss_rt + 64), &one8, 1);
+                                uint64_t rtmgr = 0;
+                                std::memcpy(&rtmgr, reinterpret_cast<const void*>(dlss_rt + 8), 8);
+                                if (rtmgr && nxrt::mem::is_mapped(rtmgr + 2316, 4)) {
+                                    std::memcpy(reinterpret_cast<void*>(rtmgr + 2316), &zero32, 4);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (upscaler_is_spatial()) {
+            const uint64_t out = c->x[8];
+            if (out && nxrt::mem::is_mapped(out, 8)) {
+                const uint64_t zero = 0;
+                std::memcpy(reinterpret_cast<void*>(out), &zero, 8);
+            }
+            return 1;
+        }
+        return 0;
+    });
     if (mode <= 0) return;
     if (mode == 1) {
         nxrt::hook_add_entry(main_base + 0x84d230, [](::Ctx* c, uint64_t, void*) -> int {
@@ -1572,56 +1638,6 @@ static void arm_native_res(uint64_t main_base) {
                 const int32_t th = (std::min)(bh, g_nat_h) & ~1;
                 std::memcpy(reinterpret_cast<void*>(out), &tw, 4);
                 std::memcpy(reinterpret_cast<void*>(out + 4), &th, 4);
-                return 1;
-            }
-            return 0;
-        });
-        // Per-frame dlss_rt hook (0x83f660 = getHaltonJitter, x0 = dlss_rt):
-        // 1) When target == base (e.g. true native 4K 3840x2160), keep dlss_rt+28 = 0 (direct-to-swapchain
-        //    DLSS output) even if f_710084d250 re-sets mode 1/3 on a scene or display transition.
-        // 2) Zero Halton(2,3) sub-pixel projection jitter when using a spatial upscaler (bilinear),
-        //    eliminating 1-pixel building-edge wobble without affecting temporal upscalers (FSR3/TAAU).
-        nxrt::hook_add_entry(main_base + 0x83f660, [](::Ctx* c, uint64_t, void*) -> int {
-            const uint64_t dlss_rt = c->x[0];
-            if (dlss_rt && nxrt::mem::is_mapped(dlss_rt, 88)) {
-                uint64_t ctx = 0;
-                std::memcpy(&ctx, reinterpret_cast<const void*>(dlss_rt), 8);
-                if (ctx && nxrt::mem::is_mapped(ctx + 0x5e0, 8)) {
-                    uint64_t view = 0;
-                    std::memcpy(&view, reinterpret_cast<const void*>(ctx + 0x5e0), 8);
-                    if (view && nxrt::mem::is_mapped(view + 40, 8)) {
-                        int32_t bw = 0, bh = 0;
-                        std::memcpy(&bw, reinterpret_cast<const void*>(view + 40), 4);
-                        std::memcpy(&bh, reinterpret_cast<const void*>(view + 44), 4);
-                        if (bw > 0 && bh > 0 && g_nat_w >= bw && g_nat_h >= bh) {
-                            uint32_t cur_mode = 0;
-                            std::memcpy(&cur_mode, reinterpret_cast<const void*>(dlss_rt + 28), 4);
-                            if (cur_mode != 0) {
-                                const uint32_t zero32 = 0;
-                                const uint8_t one8 = 1;
-                                const uint32_t ubw = static_cast<uint32_t>(bw);
-                                const uint32_t ubh = static_cast<uint32_t>(bh);
-                                std::memcpy(reinterpret_cast<void*>(dlss_rt + 28), &zero32, 4);
-                                std::memcpy(reinterpret_cast<void*>(dlss_rt + 48), &ubw, 4);
-                                std::memcpy(reinterpret_cast<void*>(dlss_rt + 52), &ubh, 4);
-                                std::memcpy(reinterpret_cast<void*>(dlss_rt + 64), &one8, 1);
-                                uint64_t rtmgr = 0;
-                                std::memcpy(&rtmgr, reinterpret_cast<const void*>(dlss_rt + 8), 8);
-                                if (rtmgr && nxrt::mem::is_mapped(rtmgr + 2316, 4)) {
-                                    std::memcpy(reinterpret_cast<void*>(rtmgr + 2316), &zero32, 4);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            const std::string up = nxrt::config_get_str("dlss", "upscaler", "bilinear");
-            if (up == "bilinear" || up == "nearest" || up == "none") {
-                const uint64_t out = c->x[8];
-                if (out && nxrt::mem::is_mapped(out, 8)) {
-                    const uint64_t zero = 0;
-                    std::memcpy(reinterpret_cast<void*>(out), &zero, 8);
-                }
                 return 1;
             }
             return 0;

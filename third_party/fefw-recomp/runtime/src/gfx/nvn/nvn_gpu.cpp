@@ -1190,7 +1190,17 @@ std::string gpu_report() {
                   static_cast<unsigned long long>(g_waits_begun.load()), static_cast<unsigned long long>(g_waits_done.load()),
                   static_cast<unsigned long long>(g->ctr.submits.load()), static_cast<unsigned long long>(g->ctr.presents.load()), got ? "" : "(busy) ", q,
                   fault.empty() ? "" : "; device fault: ", fault.empty() ? "" : fault.c_str());
-    return b;
+    // Video memory next to the fault: a device loss at 4K is either a bad submission or an exhausted heap, and the two
+    // look identical from the draw ring alone (issues #10, #63, #89, #97). vram_live_info() only queries the physical
+    // device and reads atomics, so it is safe on a lost device.
+    const VramLiveInfo vi = vram_live_info();
+    char vb[256];
+    std::snprintf(vb, sizeof vb, "VRAM: %s%llu / %llu MiB, pool copies %llu / %llu MiB, capture %s, scene scale %.3f, output scale %.3f\n",
+                  vi.budget_live ? "" : "heap ", static_cast<unsigned long long>(vi.vram_used_mb),
+                  static_cast<unsigned long long>(vi.vram_total_mb), static_cast<unsigned long long>(vi.pool_copy_mb),
+                  static_cast<unsigned long long>(vi.pool_cap_mb), vi.capture_on ? "on" : "off",
+                  static_cast<double>(render_scale_live()), static_cast<double>(output_scale_live()));
+    return std::string(b) + vb;
 }
 }  // namespace
 

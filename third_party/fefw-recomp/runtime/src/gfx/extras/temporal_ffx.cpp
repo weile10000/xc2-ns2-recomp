@@ -403,6 +403,14 @@ public:
             failed_ = true;
             return false;
         }
+        // A context this size has never seen starts with no history. The game only sets its own reset flag when it
+        // changes scene, which is not the same moment: FSR 4's model reads uninitialised history and can keep writing
+        // black for as long as that screen lasts (issue #96), so force the first dispatch of a new context to reset.
+        bool force_reset = false;
+        if (cur_slot_ < slots_.size()) {
+            Slot& cs = slots_[cur_slot_];
+            if (cs.fresh) { cs.fresh = false; force_reset = true; }
+        }
         if (!follow_size && (!ctx_ || f.render.width > max_render_.width || f.render.height > max_render_.height || f.out.width != max_out_.width ||
                              f.out.height != max_out_.height)) {
             if (!make(f.render, f.out)) {
@@ -432,7 +440,7 @@ public:
         d.sharpness = f.sharpness;
         d.frameTimeDelta = f.frame_ms;
         d.preExposure = 1.0f;
-        d.reset = f.reset;
+        d.reset = f.reset || force_reset;
         d.cameraNear = f.near_z;   // FSR orders near / far itself from the inverted-depth flag
         d.cameraFar = f.far_z;
         d.cameraFovAngleVertical = f.fov_y;
@@ -471,14 +479,22 @@ private:
         be.deviceContext.vkDevice = dev_->device();
         be.deviceContext.vkPhysicalDevice = dev_->physical();
         be.deviceContext.vkDeviceProcAddr = fx_device_proc;
-        // [upscale] fsr_version = "3.1": the 4.x DLL carries both implementations (its strings list fsr3upscaler and
-        // fsr4_*; the provider names are "3.1.6" and "4.1.2"). Without an override the DLL hands out the newest one,
-        // which on RDNA2 runs the FSR 4 model (0.1 fps measured, HANDOVER 92). FFX selects a version with
-        // ffxQuery(GET_VERSIONS) + ffxOverrideVersion chained into the create desc.
+        // [upscale] fsr_version picks the provider: the 4.x DLL carries both implementations (its strings list
+        // fsr3upscaler and fsr4_*; the provider names are "3.1.6" and "4.1.2"), and without an override the DLL hands
+        // out the newest one. FFX selects a version with ffxQuery(GET_VERSIONS) + ffxOverrideVersion chained into the
+        // create desc. The FSR 4 model used to be unusable on RDNA2 (0.1 fps, HANDOVER 92); that was the cost of the
+        // model before the optimisations, and it is no longer the reason to prefer 3.1.
         // read per context, not once per process: switching [dlss] upscaler away from fsr3 and back re-reads it, so the
         // ini can change without a restart (the version list itself is only logged when it changes)
         const std::string want_version = effective_want_version();
         ffxOverrideVersion ov = {};
+        // FSR 4.x refuses the newer API entry points unless the create desc carries the upscale-specific version desc
+        // as well: the 4.1.2 DLL answers "An instance of ffxCreateContextDescUpscaleVersion must be attached to
+        // ffxCreateContextDescUpscale and specify a valid version to access new API functions" and falls back to the
+        // 3.x behaviour (issue #96, log at 439 s). ffxOverrideVersion alone selects the provider but does not open
+        // that path, so both go into the chain when a 4.x provider is chosen.
+        ffxCreateContextDescUpscaleVersion ver = {};
+        bool api4 = false;
         bool override_ready = false;
         if (!want_version.empty()) {
             ffxQueryDescGetVersions qv = {};
@@ -505,6 +521,7 @@ private:
                         ov.versionId = ids[i];
                         ov.header.pNext = &be.header;
                         override_ready = true;
+                        api4 = names[i][0] == '4';
                         NXLOG_I(kTag, "version override: %s (id %llu) instead of the DLL default", names[i],
                                 static_cast<unsigned long long>(ids[i]));
                         break;
@@ -514,9 +531,15 @@ private:
                 NXLOG_W(kTag, "GET_VERSIONS failed (%u): the fsr_version setting is ignored", static_cast<unsigned>(qr));
             }
         }
+        if (api4) {
+            ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+            ver.version = FFX_UPSCALER_VERSION;   // the API this build was compiled against (4.1.2)
+            ver.header.pNext = &be.header;
+            ov.header.pNext = &ver.header;        // ov -> ver -> backend
+        }
         ffxCreateContextDescUpscale cd = {};
         cd.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-        cd.header.pNext = override_ready ? &ov.header : &be.header;
+        cd.header.pNext = override_ready ? &ov.header : (api4 ? &ver.header : &be.header);
         // HANDOVER 95.9: the flag set is switchable at run time (work\fsr_flags.txt) so the HDR / auto exposure
         // path can be A/B'd against the plain non-linear one the NS1 recomp's FSR 4.1.2 runs on this same driver.
         const FsrFlags fl = read_fsr_flags();
@@ -538,8 +561,9 @@ private:
             old.vkDevice = dev_->device();
             old.vkPhysicalDevice = dev_->physical();
             old.vkDeviceProcAddr = fx_device_proc;
-            if (override_ready) ov.header.pNext = &old.header;
-            cd.header.pNext = override_ready ? &ov.header : &old.header;
+            if (api4) ver.header.pNext = &old.header;
+            if (override_ready) ov.header.pNext = api4 ? &ver.header : &old.header;
+            cd.header.pNext = override_ready ? &ov.header : (api4 ? &ver.header : &old.header);
             ctx_ = nullptr;
             r = create_(&ctx_, &cd.header, nullptr);
         }
@@ -579,7 +603,10 @@ private:
         ffxContext ctx = nullptr;
         VkExtent2D render = {}, out = {};
         uint64_t used = 0;
+        bool fresh = true;   // no history yet: the first dispatch into a new context must reset
     };
+    // Which slot the dispatch is about to use, as an index because slots_ can reallocate. -1 = the single ctx_.
+    size_t cur_slot_ = static_cast<size_t>(-1);
     Slot* active_slot_ = nullptr;      // the slot make() is filling in
     ffxContext* active_ = nullptr;     // its context, for the dispatch
     std::vector<Slot> slots_;          // up to kSlots contexts, one per size
@@ -592,6 +619,7 @@ private:
             if (s.render.width == render.width && s.render.height == render.height && s.out.width == out.width && s.out.height == out.height) {
                 s.used = ++slot_tick_;
                 active_ = &s.ctx;
+                cur_slot_ = static_cast<size_t>(&s - slots_.data());
                 return &s;
             }
         }
@@ -604,12 +632,14 @@ private:
         }
         slots_.push_back(Slot{});
         active_slot_ = &slots_.back();
+        cur_slot_ = slots_.size() - 1;
         active_slot_->used = ++slot_tick_;
         active_ = &active_slot_->ctx;
         ctx_ = nullptr;   // make() would otherwise destroy the previous slot's context
         if (!make(render, out)) {
             active_ = nullptr;
             if (!slots_.empty()) slots_.pop_back();
+            cur_slot_ = static_cast<size_t>(-1);
             return nullptr;
         }
         NXLOG_I(kTag, "contexts alive: %zu (one per size, FSR follows the game's dynamic resolution)", slots_.size());
@@ -617,6 +647,7 @@ private:
     }
     void reset_contexts() {
         if (!ctx_ && slots_.empty()) return;
+        cur_slot_ = static_cast<size_t>(-1);
         if (dev_) dev_->wait_idle();
         if (ctx_) {
             destroy_(&ctx_, nullptr);

@@ -1530,11 +1530,27 @@ def unshadow_ini(install):
     return dropped
 
 
+def ini_path_value(value, install):
+    """A configured path as the ini should carry it: relative to the install folder when it lives inside it.
+
+    Absolute paths pinned the install to one drive letter, so moving or renaming the folder left every path
+    pointing at the old place (issue #95). The runtime resolves relative paths against its working directory,
+    which the launcher sets to the install folder before it starts xc2_boot.exe, and Explorer does the same for
+    a double-click. A path outside the install keeps its absolute form because there is nothing to be relative to.
+    """
+    try:
+        rel = Path(value).resolve().relative_to(Path(install).resolve())
+    except (ValueError, OSError):
+        return str(value).replace("\\", "/")
+    return rel.as_posix() or "."
+
+
 def write_ini(install, repo):
     """Give a fresh install its nxrt.ini before anything runs: the launcher edits this file, it does not invent it.
 
     The template lives in the checkout (config/nxrt.ini.in) and in a package (engine/nxrt.ini.in), and every key
-    in it is checked against config/keys.tsv by tools/ci/config_table.py --check.
+    in it is checked against config/keys.tsv by tools/ci/config_table.py --check. Paths are written relative to
+    the install folder (see ini_path_value) so the whole tree can be moved or renamed (issue #95).
     """
     ini = install / "nxrt.ini"
     if ini.is_file():
@@ -1561,7 +1577,7 @@ def write_ini(install, repo):
     }
     text = template.read_text(encoding="utf-8")
     for key, value in values.items():
-        text = text.replace("{%s}" % key, str(value).replace("\\", "/"))
+        text = text.replace("{%s}" % key, ini_path_value(value, install))
     ini.write_text(text, encoding="utf-8", newline="\n")
     return ini
 

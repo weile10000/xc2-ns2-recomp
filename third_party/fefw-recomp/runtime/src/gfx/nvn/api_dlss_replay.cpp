@@ -444,24 +444,31 @@ float half_to_float(uint16_t h) {
 // [dlss] dump_every = N: every N-th evaluation of a network and the one after it write, in the working directory, the input region and the
 // result as PNG files (dlss_<network>_<evaluation>_in.png / _out.png, exposed so that the input's mean luma shows as 0.18, x / (1 + x), sRGB)
 // and, for checking the jitter and motion vector conventions on the game's frames, the raw input (_in.bin: rgba16f), the raw motion vectors
-// (_mv.bin: rg16f, when the texture is) and _frame.txt (sizes, jitter, motion vector scale). Four pairs at most. Debugging: the game hands
-// over pre-exposure HDR, too dark to see as it is.
-void maybe_dump(Frame& f, NetGpu& n, const DlssEval& e, const Region& c, const Region& rm, const gfx::Image& result) {
+// (_mv.bin: rg16f, when the texture is) and _frame.txt (sizes, jitter, motion vector scale). [dlss] dump_max pairs at most.
+// Debugging: the game hands over pre-exposure HDR, too dark to see as it is.
+void maybe_dump(Frame& f, NetGpu& n, const DlssEval& e, const Region& c, const Region& rm, const gfx::Image& result,
+                Texture* final_tex, const Region& ro) {
     static const int64_t every = config_get_int("dlss", "dump_every", 0);
+    // [dlss] dump_max = N (default 8): how many pairs a run may write. A screen that only appears later in a
+    // session (the blade tuning screen of issue #96) needs a cap high enough to still be reached.
+    static const int64_t max_dumps = config_get_int("dlss", "dump_max", 8);
     static int dumps = 0;
     const bool second = n.dump_pair;
     n.dump_pair = false;
-    if (every <= 0 || dumps >= 8 || (!second && n.evals % static_cast<uint64_t>(every) != 0)) return;
+    if (every <= 0 || dumps >= max_dumps || (!second && n.evals % static_cast<uint64_t>(every) != 0)) return;
     const VkExtent2D in{static_cast<uint32_t>(std::lround(c.w * c.sc)), static_cast<uint32_t>(std::lround(c.h * c.sc))};
     if (!ensure(n, n.dump, in, VK_FORMAT_R16G16B16A16_SFLOAT, "dlss dump")) return;
     Texture* color = e.color.get();
     Texture* motion = e.motion.get();
     const bool mv_ok = motion && gpu::tex_gpu(motion) && gpu::tex_vk_format(motion) == VK_FORMAT_R16G16_SFLOAT && rm.w > 0 && rm.h > 0;
     const VkExtent2D mv{mv_ok ? static_cast<uint32_t>(std::lround(rm.w * rm.sc)) : 0u, mv_ok ? static_cast<uint32_t>(std::lround(rm.h * rm.sc)) : 0u};
-    gfx::Buffer bi, bo, bm;
+    gfx::Buffer bi, bo, bm, bf;
     const VkDeviceSize si = static_cast<VkDeviceSize>(in.width) * in.height * 8, so = static_cast<VkDeviceSize>(result.extent.width) * result.extent.height * 8;
     bool ok = device().create_buffer(si, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gfx::MemoryUse::Readback, &bi, "dlss dump") == VK_SUCCESS &&
-              device().create_buffer(so, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gfx::MemoryUse::Readback, &bo, "dlss dump") == VK_SUCCESS;
+              device().create_buffer(so, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gfx::MemoryUse::Readback, &bo, "dlss dump") == VK_SUCCESS &&
+              // _final.png: the game's own output texture after blit_out. The result image can be correct while the picture on
+              // screen is black (issue #96), and this is the one place that tells the two apart.
+              device().create_buffer(so, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gfx::MemoryUse::Readback, &bf, "dlss dump") == VK_SUCCESS;
     if (ok && mv_ok)
         ok = device().create_buffer(static_cast<VkDeviceSize>(mv.width) * mv.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gfx::MemoryUse::Readback, &bm,
                                     "dlss dump") == VK_SUCCESS;
@@ -497,6 +504,31 @@ void maybe_dump(Frame& f, NetGpu& n, const DlssEval& e, const Region& c, const R
     vkCmdCopyImageToBuffer(f.cb, n.dump.img.image, VK_IMAGE_LAYOUT_GENERAL, bi.buffer, 1, &r);
     r.imageExtent = {result.extent.width, result.extent.height, 1};
     vkCmdCopyImageToBuffer(f.cb, result.image, VK_IMAGE_LAYOUT_GENERAL, bo.buffer, 1, &r);
+    // The game's output texture, read back through the same region blit_out wrote: black here with a good result image means
+    // the blit (or the layout it assumes) is wrong, not the upscaler.
+    bool final_ok = false;
+    if (final_tex && gpu::tex_gpu(final_tex) && ro.w > 0 && ro.h > 0) {
+        gpu::tex_ensure_current(final_tex, f);
+        gpu::tex_transition(final_tex, f, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        const int32_t fx0 = static_cast<int32_t>(std::lround(ro.x * ro.sc)), fy0 = static_cast<int32_t>(std::lround(ro.y * ro.sc));
+        VkImageBlit fb = {};
+        fb.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, ro.level, ro.layer, 1};
+        fb.srcOffsets[0] = {std::max(0, fx0), std::max(0, fy0), 0};
+        fb.srcOffsets[1] = {std::min(fx0 + static_cast<int32_t>(result.extent.width), ro.img_w),
+                            std::min(fy0 + static_cast<int32_t>(result.extent.height), ro.img_h), 1};
+        fb.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        fb.dstOffsets[1] = {static_cast<int32_t>(result.extent.width), static_cast<int32_t>(result.extent.height), 1};
+        if (fb.srcOffsets[1].x > fb.srcOffsets[0].x && fb.srcOffsets[1].y > fb.srcOffsets[0].y) {
+            vkCmdBlitImage(f.cb, gpu::tex_image(final_tex), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, n.dump.img.image,
+                           VK_IMAGE_LAYOUT_GENERAL, 1, &fb, VK_FILTER_NEAREST);
+            gpu::memory_barrier(f.cb);
+            VkBufferImageCopy fr = {};
+            fr.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            fr.imageExtent = {result.extent.width, result.extent.height, 1};
+            vkCmdCopyImageToBuffer(f.cb, n.dump.img.image, VK_IMAGE_LAYOUT_GENERAL, bf.buffer, 1, &fr);
+            final_ok = true;
+        }
+    }
     gpu::memory_barrier(f.cb);
     char base[64], info[256];
     std::snprintf(base, sizeof base, "dlss_%u_%llu", e.net->id, static_cast<unsigned long long>(n.evals));
@@ -504,7 +536,7 @@ void maybe_dump(Frame& f, NetGpu& n, const DlssEval& e, const Region& c, const R
                   static_cast<double>(e.p.jitter[0]), static_cast<double>(e.p.jitter[1]), static_cast<double>(e.p.mv_scale[0]),
                   static_cast<double>(e.p.mv_scale[1]), mv.width, mv.height, (e.net->flags & kDlssFlagMvLowRes) ? 1 : 0, e.p.reset);
     const VkExtent2D out{result.extent.width, result.extent.height};
-    f.defer([bi, bo, bm, in, out, mv, name = std::string(base), text = std::string(info)]() mutable {
+    f.defer([bi, bo, bm, bf, final_ok, in, out, mv, name = std::string(base), text = std::string(info)]() mutable {
         device().invalidate_buffer(bi);
         device().invalidate_buffer(bo);
         if (bm.buffer) device().invalidate_buffer(bm);
@@ -540,6 +572,7 @@ void maybe_dump(Frame& f, NetGpu& n, const DlssEval& e, const Region& c, const R
             return gfx::save_png_rgba(path, px.data(), ext.width, ext.height);
         };
         const bool wi = encode(bi, in, name + "_in.png"), wo = encode(bo, out, name + "_out.png");
+        const bool wf = final_ok && encode(bf, out, name + "_final.png");
         double weight = 0;   // the history's accumulated sample weight (taau): low where it was clipped away
         const uint16_t* o = static_cast<const uint16_t*>(bo.mapped);
         for (size_t i = 0; i < static_cast<size_t>(out.width) * out.height; ++i) weight += half_to_float(o[i * 4 + 3]);
@@ -547,8 +580,9 @@ void maybe_dump(Frame& f, NetGpu& n, const DlssEval& e, const Region& c, const R
         NXLOG_I(kTag, "dumped %s: input %ux%u %s, result %ux%u %s, motion %ux%u, exposure x%.4g (input mean luma %.4g), mean history weight %.2f",
                 name.c_str(), in.width, in.height, wi ? "written" : "not written", out.width, out.height, wo ? "written" : "not written", mv.width, mv.height,
                 static_cast<double>(k), mean, weight);
-        for (gfx::Buffer* b : {&bi, &bo, &bm})
+        for (gfx::Buffer* b : {&bi, &bo, &bm, &bf})
             if (b->buffer) device().destroy_buffer(*b);
+        (void)wf;
     });
 }
 
@@ -794,7 +828,7 @@ void dlss_replay(gpu::Frame& f, Obj* o) {
             h.valid = false;   // the built-in history is not kept meanwhile
             ++n.evals;
             g_in_use.store(static_cast<int>(u), std::memory_order_relaxed);
-            maybe_dump(f, n, *e, c, rm, n.sdk[3].img);
+            maybe_dump(f, n, *e, c, rm, n.sdk[3].img, out, ro);
             feed_framegen(f, n, prep, in_img, tf.jitter, sdk_reset, tf.depth_inverted, true);
             return;
         }
@@ -841,7 +875,7 @@ void dlss_replay(gpu::Frame& f, Obj* o) {
     const Upscaler active = tf.spatial ? Upscaler::Bilinear : Upscaler::Taau;
     g_in_use.store(static_cast<int>(active), std::memory_order_relaxed);
     gpu::counters().dispatches.fetch_add(1, std::memory_order_relaxed);
-    maybe_dump(f, n, *e, c, rm, dst.img);
+    maybe_dump(f, n, *e, c, rm, dst.img, out, ro);
     feed_framegen(f, n, prep, in_img, tf.jitter, reset, tf.depth_inverted, false);
     if (n.evals % 1800 == 0)
         NXLOG_I(kTag, "network %u: %llu evaluations, %llu history resets, %s %ux%u -> %ux%u", net.id, static_cast<unsigned long long>(n.evals),
