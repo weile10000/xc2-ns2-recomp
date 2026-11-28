@@ -21,6 +21,7 @@ This directory is a **modified fork** of `Goldoire/fefw-recomp` (the original Gi
 
 | `file` | date | change |
 |---|---|---|
+| `runtime/src/gfx/nvn/{nvn_spirv_patch.h,nvn_spirv_patch.cpp,nvn_pipeline.cpp,nvn_replay.cpp}` | 2026-11-28 | add `spirv_can_scale_frag_image_atomic()` / `spirv_scale_frag_image_atomic()` to rewrite 2D fragment `OpImageTexelPointer` coordinates to raw `ivec2(gl_FragCoord.xy)` and keep matched-size storage images scaled in `prepare_textures()`, preventing XC2's 640×360 light-list mask and shared half-res depth/effect buffers from dropping to 1x under `native_res=0` (issue #94) |
 | `runtime/scripts/gen_taau_shaders.py` + `runtime/src/gfx/extras/{taau.h,taau.cpp,taau_shaders.inc}` + `runtime/src/gfx/nvn/api_dlss_replay.cpp` | 2026-11-28 | add `kTaauOpaqueAlphaComp` / `Taau::record_opaque_alpha()` to force `output.a = 1.0` after SDK upscaler dispatch (FSR 4.1.2 writes `alpha = 0.0`, causing `SRC_ALPHA` UI composite screens such as XC2 Blade Resonance to render 3D black; issue #96), and write `alpha = 1.0` in `kSpatial` (bilinear) mode |
 | `runtime/src/gfx/shaders/nav_ribbon.{vert,frag}` | 2026-11-27 | new: GLSL shaders for native Vulkan 3D translucent conveyor-belt navigation ribbon with read-only scene depth occlusion |
 | `runtime/src/gfx/extras/nav_ribbon.{h,cpp}` + `nav_ribbon_shaders.inc` | 2026-11-27 | new: `NavRibbonPass` dynamic-rendering Vulkan 3D ribbon pass (per-slot upload VB, depth sampler, SDR + HDR safe) |

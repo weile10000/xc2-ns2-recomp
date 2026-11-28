@@ -48,6 +48,7 @@
 #include "extras/spatial_upscaler.h"
 #include "extras/temporal.h"
 #include "nvn_pipeline.h"
+#include "nvn_spirv_patch.h"
 #include "nvn_shaders.h"
 #include "nvn_texprep.h"
 
@@ -1938,8 +1939,22 @@ void prepare_textures(const ProgLayout& pl) {
             g_storage_bound.push_back(r.tex);
             // [gfx] render_scale: an image a fragment shader only reads (imageLoad at its own pixel, XC2 NS2's decals reading the G-buffer
             // normals) keeps its scale: the translator scales imageLoad coordinates like texelFetch (TexelFetchScale), and support_for_draw
-            // hands it the scale. Written images (imageStore coordinates are not scaled) and compute bindings still go back to 1.
-            const bool keep = d.nvn_stage == kFragment && !d.shader->refl.bindings[d.index].written;
+            // hands it the scale. Fragment shaders whose 2D storage-image atomics were patched to raw ivec2(gl_FragCoord.xy)
+            // (spirv_scale_frag_image_atomic, issue #94) also keep their scale when matched 1:1 with the pass's render target.
+            // Other written images and compute bindings still go back to 1.
+            bool keep = d.nvn_stage == kFragment && !d.shader->refl.bindings[d.index].written;
+            if (!keep && d.nvn_stage == kFragment && render_scale() != 1.0f) {
+                static std::unordered_map<const ShaderInfo*, bool> s_atomic_scaled;
+                auto it = s_atomic_scaled.find(d.shader);
+                if (it == s_atomic_scaled.end())
+                    it = s_atomic_scaled.emplace(d.shader, spirv_can_scale_frag_image_atomic(d.shader->spirv)).first;
+                if (it->second) {
+                    Texture* rt = S.ncolor && S.color_tex[0] ? S.color_tex[0].get() : S.depth_tex.get();
+                    if (rt && r.tex->b.width == rt->b.width && r.tex->b.height == rt->b.height && tex_scale(r.tex) == tex_scale(rt)) {
+                        keep = true;
+                    }
+                }
+            }
             if (r.tex->cpu_dirty.load() || tex_layout(r.tex) != VK_IMAGE_LAYOUT_GENERAL || (tex_scale(r.tex) != 1.0f && !keep)) need_storage.push_back(r.tex);
             if (!keep) g_storage_unscale.push_back(r.tex);
             if (!keep && d.nvn_stage != kCompute) written_gfx = true;

@@ -119,4 +119,12 @@ struct SpvXfbOutput {
 // captured outputs, stride the bytes of one captured vertex. False (out untouched): no Location outputs or an unexpected module.
 bool spirv_add_xfb(const std::vector<uint32_t>& in, std::vector<uint32_t>& out, std::vector<SpvXfbOutput>* layout, uint32_t* stride);
 
+// spirv_scale_frag_image_atomic: a fragment shader that performs image atomic ops (OpImageTexelPointer) on a 2D storage image
+// at ivec2(trunc(gl_FragCoord.xy / render_scale[0])) (e.g. XC2 NS2 light-list registration mask R32UI 640x360, issue #94).
+// Rewrites the OpImageTexelPointer coordinate to raw ivec2(gl_FragCoord.xy) so the storage image, its paired light-list RT, and
+// the shared half-res depth/effect targets can all stay at the attachment scale instead of cascading back to 1x.
+// Bit-identical when render_scale == 1.0.
+bool spirv_can_scale_frag_image_atomic(const std::vector<uint32_t>& in);
+bool spirv_scale_frag_image_atomic(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);
+
 }  // namespace nxrt::nvn::be::gpu

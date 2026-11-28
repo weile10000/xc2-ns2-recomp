@@ -1614,4 +1614,151 @@ bool spirv_uint_samplers(const std::vector<uint32_t>& in, const std::vector<SpvS
     return true;
 }
 
+// ---- fragment storage-image atomic coordinate scaling (issue #94) ---------------------------------------------------------------
+// Ryujinx divides gl_FragCoord.xy by support_buffer.render_scale[0] so guest pixel math stays in 1x coordinates, which leaves
+// OpImageTexelPointer coordinates unscaled (1x) and forces the runtime to drop the storage image + every render target in the
+// same pass (and every pass sharing its depth buffer) back to 1x. When a fragment shader only indexes a 2D non-arrayed non-MS
+// storage image via OpImageTexelPointer with an ivec2/uvec2 constructed from scalars (e.g. XC2's light-list mask shaders),
+// replacing the OpImageTexelPointer coordinate with raw ivec2(gl_FragCoord.xy) keeps the storage image 1:1 with the scaled
+// render targets at every scale (and is bit-identical at scale 1.0).
+namespace {
+
+struct FragAtomicPlan {
+    bool ok = false;
+    uint32_t frag_var = 0;
+    uint32_t f32_ty = 0;
+    uint32_t v4f_ty = 0;
+    size_t v4f_end = 0;
+    uint32_t v2f_ty = 0;
+    struct Site {
+        size_t at = 0;
+        uint32_t coord_ty = 0;
+        bool is_unsigned = false;
+    };
+    std::vector<Site> sites;
+};
+
+FragAtomicPlan analyze_frag_image_atomic(const std::vector<uint32_t>& in) {
+    FragAtomicPlan plan;
+    enum : uint32_t {
+        OpEntryPointOp = 15, OpTypeIntOp = 21, OpTypeFloatOp = 22, OpTypeVectorOp = 23, OpTypeImageOp = 25,
+        OpTypePointerOp = 32, OpVariableOp = 59, OpImageTexelPointerOp = 60, OpDecorateOp = 71,
+        OpCompositeConstructOp = 80, OpImageWriteOp = 99, OpFDivOp = 136,
+        ModelFragment = 4, StorageClassInput = 1, DecorationBuiltIn = 11, BuiltInFragCoord = 15,
+    };
+    if (in.size() < 5) return plan;
+    bool is_fragment = false, has_fdiv = false;
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> int_ty;          // id -> (width, signedness)
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> vec_ty;          // id -> (comp_ty, count)
+    std::map<uint32_t, bool> img2d_ty;                                 // id -> 2D non-arrayed non-MS
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> ptr_ty;          // id -> (storage_class, pointee)
+    std::map<uint32_t, uint32_t> var_ty;                               // var_id -> ptr_type
+    std::map<uint32_t, uint32_t> composite2_ty;                        // res_id -> vec2 type
+    uint32_t frag_var = 0;
+    size_t v4f_end = 0;
+
+    for (size_t i = 5; i < in.size();) {
+        const uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
+        if (!len || i + len > in.size()) return plan;
+        if (op == OpEntryPointOp && len >= 3 && in[i + 1] == ModelFragment) is_fragment = true;
+        else if (op == OpImageWriteOp) return plan;   // do not touch shaders with explicit OpImageWrite
+        else if (op == OpFDivOp) has_fdiv = true;
+        else if (op == OpDecorateOp && len >= 4 && in[i + 2] == DecorationBuiltIn && in[i + 3] == BuiltInFragCoord)
+            frag_var = in[i + 1];
+        else if (op == OpTypeIntOp && len >= 4) int_ty[in[i + 1]] = {in[i + 2], in[i + 3]};
+        else if (op == OpTypeFloatOp && len >= 3 && in[i + 2] == 32) plan.f32_ty = in[i + 1];
+        else if (op == OpTypeVectorOp && len >= 4) {
+            vec_ty[in[i + 1]] = {in[i + 2], in[i + 3]};
+            if (plan.f32_ty && in[i + 2] == plan.f32_ty) {
+                if (in[i + 3] == 4) { plan.v4f_ty = in[i + 1]; v4f_end = i + len; }
+                else if (in[i + 3] == 2) plan.v2f_ty = in[i + 1];
+            }
+        } else if (op == OpTypeImageOp && len >= 9) {
+            img2d_ty[in[i + 1]] = (in[i + 3] == 1 && in[i + 5] == 0 && in[i + 6] == 0);   // Dim2D, !Arrayed, !MS
+        } else if (op == OpTypePointerOp && len >= 4) {
+            ptr_ty[in[i + 1]] = {in[i + 2], in[i + 3]};
+        } else if (op == OpVariableOp && len >= 4) {
+            var_ty[in[i + 2]] = in[i + 1];
+        } else if (op == OpCompositeConstructOp && len == 5) {
+            composite2_ty[in[i + 2]] = in[i + 1];
+        } else if (op == OpImageTexelPointerOp && len == 6) {
+            const uint32_t img_var = in[i + 3], coord = in[i + 4];
+            auto iv = var_ty.find(img_var);
+            if (iv == var_ty.end()) return plan;
+            auto ip = ptr_ty.find(iv->second);
+            if (ip == ptr_ty.end()) return plan;
+            auto it = img2d_ty.find(ip->second.second);
+            if (it == img2d_ty.end() || !it->second) return plan;
+            auto ct = composite2_ty.find(coord);
+            if (ct == composite2_ty.end()) return plan;
+            auto vt = vec_ty.find(ct->second);
+            if (vt == vec_ty.end() || vt->second.second != 2) return plan;
+            auto nt = int_ty.find(vt->second.first);
+            if (nt == int_ty.end() || nt->second.first != 32) return plan;
+            plan.sites.push_back({i, ct->second, nt->second.second == 0});
+        }
+        i += len;
+    }
+    if (!is_fragment || !has_fdiv || !frag_var || !plan.f32_ty || !plan.v4f_ty || plan.sites.empty()) return plan;
+    auto fv = var_ty.find(frag_var);
+    if (fv == var_ty.end()) return plan;
+    auto fp = ptr_ty.find(fv->second);
+    if (fp == ptr_ty.end() || fp->second.first != StorageClassInput || fp->second.second != plan.v4f_ty) return plan;
+    plan.frag_var = frag_var;
+    plan.v4f_end = v4f_end;
+    plan.ok = true;
+    return plan;
+}
+
+}  // namespace
+
+bool spirv_can_scale_frag_image_atomic(const std::vector<uint32_t>& in) {
+    return analyze_frag_image_atomic(in).ok;
+}
+
+bool spirv_scale_frag_image_atomic(const std::vector<uint32_t>& in, std::vector<uint32_t>& out) {
+    const FragAtomicPlan plan = analyze_frag_image_atomic(in);
+    if (!plan.ok) return false;
+    enum : uint32_t {
+        OpTypeVectorOp = 23, OpImageTexelPointerOp = 60, OpLoadOp = 61, OpVectorShuffleOp = 79,
+        OpConvertFToUOp = 109, OpConvertFToSOp = 110,
+    };
+    uint32_t bound = in[3];
+    uint32_t v2f_ty = plan.v2f_ty;
+    const bool need_v2f = (v2f_ty == 0);
+    if (need_v2f) v2f_ty = bound++;
+
+    std::map<size_t, FragAtomicPlan::Site> site_map;
+    for (const FragAtomicPlan::Site& s : plan.sites) site_map[s.at] = s;
+
+    out.clear();
+    out.reserve(in.size() + (need_v2f ? 4 : 0) + plan.sites.size() * 15);
+    out.insert(out.end(), in.begin(), in.begin() + 5);
+
+    for (size_t i = 5; i < in.size();) {
+        const uint32_t len = in[i] >> 16;
+        if (!len || i + len > in.size()) { out.clear(); return false; }
+        auto sit = site_map.find(i);
+        if (sit != site_map.end()) {
+            const uint32_t id_fc = bound++;
+            const uint32_t id_xy = bound++;
+            const uint32_t id_ixy = bound++;
+            const uint32_t cvt_op = sit->second.is_unsigned ? OpConvertFToUOp : OpConvertFToSOp;
+            out.insert(out.end(), {(4u << 16) | OpLoadOp, plan.v4f_ty, id_fc, plan.frag_var});
+            out.insert(out.end(), {(7u << 16) | OpVectorShuffleOp, v2f_ty, id_xy, id_fc, id_fc, 0u, 1u});
+            out.insert(out.end(), {(4u << 16) | cvt_op, sit->second.coord_ty, id_ixy, id_xy});
+            out.insert(out.end(), {(6u << 16) | OpImageTexelPointerOp, in[i + 1], in[i + 2], in[i + 3], id_ixy, in[i + 5]});
+        } else {
+            out.insert(out.end(), in.begin() + static_cast<std::ptrdiff_t>(i),
+                       in.begin() + static_cast<std::ptrdiff_t>(i + len));
+            if (need_v2f && i + len == plan.v4f_end) {
+                out.insert(out.end(), {(4u << 16) | OpTypeVectorOp, v2f_ty, plan.f32_ty, 2u});
+            }
+        }
+        i += len;
+    }
+    out[3] = bound;
+    return true;
+}
+
 }  // namespace nxrt::nvn::be::gpu

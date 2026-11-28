@@ -345,6 +345,16 @@ static VkShaderModule create_module(const std::vector<uint32_t>& words, const ch
                 NXLOG_I(kTag, "early_fragment_tests (%s): patched fs %s", amd ? "EarlyAndLateFragmentTestsAMD" : "EarlyFragmentTests", what);
         }
     }
+    // [gfx] render_scale (issue #94): fragment shaders performing 2D storage-image atomics at gl_FragCoord.xy / scale
+    // (XC2's 640x360 light-list registration mask) are rewritten to raw ivec2(gl_FragCoord.xy) so the mask, list, and
+    // shared half-res depth/effect targets stay at the attachment scale instead of falling back to 1x.
+    std::vector<uint32_t> with_scaled_atomic;
+    if (spirv_scale_frag_image_atomic(*code, with_scaled_atomic)) {
+        code = &with_scaled_atomic;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 20)
+            NXLOG_I(kTag, "frag_image_atomic_scale: patched fs %s to raw gl_FragCoord.xy", what ? what : "?");
+    }
     static const bool init_outputs = config_get_bool("nvn", "init_outputs", true);
     std::vector<uint32_t> initialised;
     if (init_outputs && spirv_init_outputs(*code, initialised)) code = &initialised;
