@@ -25,9 +25,11 @@ struct PortraitUV {
 };
 
 // speaker_id (the VoiceID column of common.bdat) -> /menu/image/face.wilay cell.
-// The atlas is 8x26 cells of 256x256: 0..15 are the story party in the atlas' own order, 16..63 the
-// blades, with the three Expansion Pass blades at 34..36. A speaker that is not listed falls back to
-// the Core Crystal monogram, which is the correct look for the generic blades (61..80).
+// The atlas is 8x26 cells of 256x256: 0..15 are the story party in the atlas' own order, 16..47 the
+// base game Drivers and rare blades, 48 and 56..63 the rest. The Expansion Pass blades live in
+// mnu_face.wilay instead (see kMenuFaceCells) - except KOS-MOS, who does have cell 56 here.
+// A speaker that is not listed falls back to the Core Crystal monogram, which is the correct look for
+// the generic blades (61..80).
 // Adding a blade is one line here and nothing else.
 struct FaceCell {
     uint16_t speaker_id;
@@ -87,18 +89,27 @@ constexpr FaceCell kFaceCells[] = {
     {51, 35},  // 雷鼓
     {52, 36},  // 八重切 Zenobia
     {53, 37},  // 伊吹
+    {54, 56},  // KOS-MOS Re: (base 图集里就有，不必走 BC7 菜单图)
 };
 
-// speaker_id -> /menu/image/mnu_face.wilay cell (BC7, 8x12 of 192x192). The Expansion Pass blades and the
-// Switch 2 Edition additions have no cell in face.wilay at all, so this is the only portrait they have.
+// speaker_id -> /menu/image/mnu_face.wilay cell (BC7, 8x12 of 192x192). The Expansion Pass blades, the
+// Switch 2 Edition additions, and five base game rare blades (力男/天威/鸣/玛瑙/月 - speakers 33/55/56/57/58)
+// have no cell in face.wilay at all, so this is the only portrait they have.
+// This atlas needs the BC7 upload path, so it is only reachable on a runtime that has it.
 constexpr FaceCell kMenuFaceCells[] = {
-    {54, 48},   // KOS-MOS Re:
+    {59, 50},   // T-elos Re: (Expansion Pass; cells 49..55 are the seven DLC blades in ilust order)
     {501, 49},  // 花巴斯塔 Poppibuster
     {502, 51},  // 修尔克 Shulk
     {503, 52},  // 菲奥伦 Fiora
     {504, 53},  // 神八 Corvin
     {505, 54},  // 火花 Crossette
     {506, 55},  // 艾尔玛 Elma
+    // Base game rare blades that have no cell in face.wilay at all: their only portrait is here.
+    {33, 83},   // 力男 Wulfric
+    {55, 85},   // 天威 Herald
+    {56, 87},   // 鸣 Vale
+    {57, 86},   // 玛瑙 Agate
+    {58, 93},   // 月 Dahlia
     {231, 60},  // MOMO 第一形态
     {232, 63},  // MOMO 第二形态
 };
